@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"html/template"
 	"io/ioutil"
@@ -13,6 +14,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	pprof_http "net/http/pprof"
@@ -44,7 +46,6 @@ var (
 	analytics                RedisAnalyticsHandler
 	GlobalEventsJSVM         JSVM
 	memProfFile              *os.File
-	Policies                 = map[string]Policy{}
 	MainNotifier             RedisNotifier
 	DefaultOrgStore          DefaultSessionManager
 	DefaultQuotaStore        DefaultSessionManager
@@ -193,13 +194,18 @@ func buildConnStr(resource string) string {
 // Pull API Specs from configuration
 var APILoader = APIDefinitionLoader{}
 
-func getAPISpecs() []*APISpec {
-	var apiSpecs []*APISpec
+// Currently loaded specs
+var APISpecs []*APISpec
+var apiSpecSyncMutex sync.Mutex
+
+func syncAPISpecs() {
+	apiSpecSyncMutex.Lock()
+	defer apiSpecSyncMutex.Unlock()
 
 	if config.UseDBAppConfigs {
 
 		connStr := buildConnStr("/system/apis")
-		apiSpecs = APILoader.LoadDefinitionsFromDashboardService(connStr, config.NodeSecret)
+		APISpecs = APILoader.LoadDefinitionsFromDashboardService(connStr, config.NodeSecret)
 
 		log.WithFields(logrus.Fields{
 			"prefix": "main",
@@ -209,31 +215,35 @@ func getAPISpecs() []*APISpec {
 			"prefix": "main",
 		}).Debug("Using RPC Configuration")
 
-		apiSpecs = APILoader.LoadDefinitionsFromRPC(config.SlaveOptions.RPCKey)
+		APISpecs = APILoader.LoadDefinitionsFromRPC(config.SlaveOptions.RPCKey)
 	} else {
-		apiSpecs = APILoader.LoadDefinitions(config.AppPath)
+		APISpecs = APILoader.LoadDefinitions(config.AppPath)
 	}
 
 	log.WithFields(logrus.Fields{
 		"prefix": "main",
-	}).Printf("Detected %v APIs", len(apiSpecs))
+	}).Printf("Detected %v APIs", len(APISpecs))
 
 	if config.AuthOverride.ForceAuthProvider {
-		for i := range apiSpecs {
-			apiSpecs[i].AuthProvider = config.AuthOverride.AuthProvider
+		for i := range APISpecs {
+			APISpecs[i].AuthProvider = config.AuthOverride.AuthProvider
 		}
 	}
 
 	if config.AuthOverride.ForceSessionProvider {
-		for i := range apiSpecs {
-			apiSpecs[i].SessionProvider = config.AuthOverride.SessionProvider
+		for i := range APISpecs {
+			APISpecs[i].SessionProvider = config.AuthOverride.SessionProvider
 		}
 	}
-
-	return apiSpecs
 }
 
-func getPolicies() {
+var Policies = map[string]Policy{}
+var policySyncMux sync.Mutex
+
+func syncPolicies() {
+	policySyncMux.Lock()
+	defer policySyncMux.Unlock()
+
 	pols := make(map[string]Policy)
 	log.WithFields(logrus.Fields{
 		"prefix": "main",
@@ -609,11 +619,11 @@ func rpcReloadLoop(rpcKey string) {
 
 func doReload() {
 	// Load the API Policies
-	getPolicies()
-
+	syncPolicies()
 	// load the specs
-	specs := getAPISpecs()
-	if len(specs) == 0 {
+	syncAPISpecs()
+
+	if len(APISpecs) == 0 {
 		log.WithFields(logrus.Fields{
 			"prefix": "main",
 		}).Warning("No API Definitions found, not reloading")
@@ -636,7 +646,7 @@ func doReload() {
 	if config.ControlAPIPort == 0 {
 		loadAPIEndpoints(newRouter)
 	}
-	loadApps(specs, newRouter)
+	loadApps(APISpecs, newRouter)
 
 	newServeMux := http.NewServeMux()
 	newServeMux.Handle("/", mainRouter)
@@ -1123,6 +1133,28 @@ func start(arguments map[string]interface{}) {
 	go reloadLoop(time.Tick(time.Second))
 }
 
+func getTLSConfigForClient(baseConfig *tls.Config) func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	return func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		for _, spec := range APISpecs {
+			if spec.UseMutualTLSAuth && (spec.Domain == hello.ServerName || spec.Domain == "") {
+				caCertPool := x509.NewCertPool()
+
+				if spec.MutualTLSCertificate != "" {
+					caCertPool.AppendCertsFromPEM([]byte(spec.MutualTLSCertificate))
+				}
+
+				newConfig := baseConfig.Clone()
+				newConfig.ClientAuth = tls.RequireAndVerifyClientCert
+				newConfig.ClientCAs = caCertPool
+
+				return newConfig, nil
+			}
+		}
+
+		return baseConfig, nil
+	}
+}
+
 func generateListener(listenPort int) (net.Listener, error) {
 	listenAddress := config.ListenAddress
 	if listenPort == 0 {
@@ -1155,6 +1187,8 @@ func generateListener(listenPort int) (net.Listener, error) {
 			MinVersion:         config.HttpServerOptions.MinVersion,
 			InsecureSkipVerify: config.HttpServerOptions.SSLInsecureSkipVerify,
 		}
+		config.GetConfigForClient = getTLSConfigForClient(&config)
+
 		return tls.Listen("tcp", targetPort, &config)
 
 	} else if config.HttpServerOptions.UseLE_SSL {
@@ -1168,6 +1202,8 @@ func generateListener(listenPort int) (net.Listener, error) {
 		config := tls.Config{
 			GetCertificate: LE_MANAGER.GetCertificate,
 		}
+		config.GetConfigForClient = getTLSConfigForClient(&config)
+
 		return tls.Listen("tcp", targetPort, &config)
 
 	} else {
@@ -1248,10 +1284,11 @@ func listen(l, controlListener net.Listener, err error) {
 		startDRL()
 
 		if !RPC_EmergencyMode {
-			specs := getAPISpecs()
-			if specs != nil {
-				loadApps(specs, defaultRouter)
-				getPolicies()
+			syncAPISpecs()
+
+			if APISpecs != nil {
+				loadApps(APISpecs, defaultRouter)
+				syncPolicies()
 			}
 
 			if config.ControlAPIPort > 0 {
@@ -1335,10 +1372,10 @@ func listen(l, controlListener net.Listener, err error) {
 
 		// Resume accepting connections in a new goroutine.
 		if !RPC_EmergencyMode {
-			specs := getAPISpecs()
-			if specs != nil {
-				loadApps(specs, defaultRouter)
-				getPolicies()
+			syncAPISpecs()
+			if APISpecs != nil {
+				loadApps(APISpecs, defaultRouter)
+				syncPolicies()
 			}
 
 			if config.ControlAPIPort > 0 {
