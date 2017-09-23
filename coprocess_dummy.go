@@ -29,17 +29,17 @@ var (
 )
 
 type CoProcessMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 	HookType         coprocess.HookType
 	HookName         string
 	MiddlewareDriver apidef.MiddlewareDriver
 }
 
-func (m *CoProcessMiddleware) GetName() string {
+func (m *CoProcessMiddleware) Name() string {
 	return "CoProcessMiddlewareDummy"
 }
 
-func (m *CoProcessMiddleware) IsEnabledForSpec() bool { return false }
+func (m *CoProcessMiddleware) EnabledForSpec() bool { return false }
 func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
 	return nil, 200
 }
@@ -61,4 +61,4 @@ func CoProcessInit() {
 
 func doCoprocessReload() {}
 
-func newExtractor(referenceSpec *APISpec, mw *BaseMiddleware) {}
+func newExtractor(referenceSpec *APISpec, mw BaseMiddleware) {}

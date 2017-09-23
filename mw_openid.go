@@ -18,13 +18,13 @@ import (
 const OIDPREFIX = "openid"
 
 type OpenIDMW struct {
-	*BaseMiddleware
+	BaseMiddleware
 	providerConfiguration     *openid.Configuration
 	provider_client_policymap map[string]map[string]string
 	lock                      sync.RWMutex
 }
 
-func (k *OpenIDMW) GetName() string {
+func (k *OpenIDMW) Name() string {
 	return "OpenIDMW"
 }
 
@@ -185,7 +185,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 		}
 
 		session = newSession
-		session.MetaData = map[string]string{"TykJWTSessionID": sessionID, "ClientID": clientID}
+		session.MetaData = map[string]interface{}{"TykJWTSessionID": sessionID, "ClientID": clientID}
 		session.Alias = clientID + ":" + user.ID
 
 		// Update the session in the session manager in case it gets called again
@@ -212,10 +212,10 @@ func (k *OpenIDMW) reportLoginFailure(tykId string, r *http.Request) {
 	}).Warning("Attempted access with invalid key.")
 
 	// Fire Authfailed Event
-	AuthFailed(k.BaseMiddleware, r, tykId)
+	AuthFailed(k, r, tykId)
 
 	// Report in health check
-	ReportHealthCheckValue(k.Spec.Health, KeyFailure, "1")
+	reportHealthValue(k.Spec, KeyFailure, "1")
 }
 
 func (k *OpenIDMW) setContextVars(r *http.Request, token *jwt.Token) {

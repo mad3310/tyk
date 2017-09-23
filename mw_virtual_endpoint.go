@@ -7,10 +7,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 )
 
 // RequestObject is marshalled to JSON string and passed into JSON middleware
@@ -34,48 +36,45 @@ type VMResponseObject struct {
 
 // DynamicMiddleware is a generic middleware that will execute JS code before continuing
 type VirtualEndpoint struct {
-	*BaseMiddleware
+	BaseMiddleware
 	sh SuccessHandler
 }
 
-func (d *VirtualEndpoint) GetName() string {
+func (d *VirtualEndpoint) Name() string {
 	return "VirtualEndpoint"
 }
 
-func PreLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
-	if j == nil {
-		log.Error("No JSVM loaded, cannot init methods")
-		return
-	}
-	if meta == nil {
-		return
-	}
+func preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
+	// the only call site uses (&foo, &bar) so meta and j won't be
+	// nil.
+	var src interface{}
 	switch meta.FunctionSourceType {
 	case "file":
-		js, err := ioutil.ReadFile(meta.FunctionSourceURI)
+		log.Debug("Loading JS Endpoint File: ", meta.FunctionSourceURI)
+		f, err := os.Open(meta.FunctionSourceURI)
 		if err != nil {
-			log.Error("Failed to load Endpoint JS: ", err)
-		} else {
-			// No error, load the JS into the VM
-			log.Debug("Loading JS Endpoint File: ", meta.FunctionSourceURI)
-			j.VM.Run(js)
-		}
-	case "blob":
-		if globalConf.DisableVirtualPathBlobs {
-			log.Error("[JSVM] Blobs not allowerd on this node")
+			log.Error("Failed to open Endpoint JS: ", err)
 			return
 		}
-
+		src = f
+	case "blob":
+		if config.Global.DisableVirtualPathBlobs {
+			log.Error("[JSVM] Blobs not allowed on this node")
+			return
+		}
+		log.Debug("Loading JS blob")
 		js, err := base64.StdEncoding.DecodeString(meta.FunctionSourceURI)
 		if err != nil {
 			log.Error("Failed to load blob JS: ", err)
-		} else {
-			// No error, load the JS into the VM
-			log.Debug("Loading JS blob")
-			j.VM.Run(js)
+			return
 		}
+		src = js
 	default:
 		log.Error("Type must be either file or blob (base64)!")
+		return
+	}
+	if _, err := j.VM.Run(src); err != nil {
+		log.Error("Could not load virtual endpoint JS: ", err)
 	}
 }
 
@@ -83,8 +82,8 @@ func (d *VirtualEndpoint) Init() {
 	d.sh = SuccessHandler{d.BaseMiddleware}
 }
 
-func (d *VirtualEndpoint) IsEnabledForSpec() bool {
-	if !globalConf.EnableJSVM {
+func (d *VirtualEndpoint) EnabledForSpec() bool {
+	if !config.Global.EnableJSVM {
 		return false
 	}
 	for _, version := range d.Spec.VersionData.Versions {
@@ -96,16 +95,16 @@ func (d *VirtualEndpoint) IsEnabledForSpec() bool {
 }
 
 func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Request) *http.Response {
-	_, versionPaths, _, _ := d.Spec.GetVersionData(r)
-	found, meta := d.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, VirtualPath)
+	_, versionPaths, _, _ := d.Spec.Version(r)
+	found, meta := d.Spec.CheckSpecMatchesStatus(r, versionPaths, VirtualPath)
 
 	if !found {
 		return nil
 	}
 
 	var copiedRequest *http.Request
-	if RecordDetail(r) {
-		copiedRequest = CopyHttpRequest(r)
+	if recordDetail(r) {
+		copiedRequest = copyRequest(r)
 	}
 
 	t1 := time.Now().UnixNano()
@@ -126,7 +125,7 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 	}
 
 	// We need to copy the body _back_ for the decode
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(originalBody))
+	r.Body = ioutil.NopCloser(bytes.NewReader(originalBody))
 	r.ParseForm()
 	requestData.Params = r.Form
 
@@ -155,7 +154,11 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 
 	// Run the middleware
 	vm := d.Spec.JSVM.VM.Copy()
-	returnRaw, _ := vm.Run(vmeta.ResponseFunctionName + `(` + string(asJsonRequestObj) + `, ` + string(sessionAsJsonObj) + `, ` + confData + `);`)
+	returnRaw, err := vm.Run(vmeta.ResponseFunctionName + `(` + string(asJsonRequestObj) + `, ` + string(sessionAsJsonObj) + `, ` + confData + `);`)
+	if err != nil {
+		log.Error("Failed to run virtual endpoint JS code:", err)
+		return nil
+	}
 	returnDataStr, _ := returnRaw.ToString()
 
 	// Decode the return object
@@ -168,12 +171,25 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 
 	// Save the sesison data (if modified)
 	if vmeta.UseSession {
-		session.MetaData = newResponseData.SessionMeta
+		session.MetaData = mapStrsToIfaces(newResponseData.SessionMeta)
 		d.Spec.SessionManager.UpdateSession(token, session, getLifetime(d.Spec, session))
 	}
 
 	log.Debug("JSVM Virtual Endpoint execution took: (ns) ", time.Now().UnixNano()-t1)
 
+	copiedResponse := forceResponse(w, r, &newResponseData, d.Spec, session, false)
+
+	go d.sh.RecordHit(r, 0, copiedResponse.StatusCode, copiedRequest, copiedResponse)
+
+	return copiedResponse
+
+}
+
+func forceResponse(w http.ResponseWriter,
+	r *http.Request,
+	newResponseData *VMResponseObject,
+	spec *APISpec,
+	session *SessionState, isPre bool) *http.Response {
 	responseMessage := []byte(newResponseData.Response.Body)
 
 	// Create an http.Response object so we can send it tot he cache middleware
@@ -195,41 +211,20 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 	newResponse.Header.Set("Server", "tyk")
 	newResponse.Header.Set("Date", requestTime)
 
-	// Handle response middleware
-	if err := handleResponseChain(d.Spec.ResponseChain, w, newResponse, r, session); err != nil {
-		log.Error("Response chain failed! ", err)
-	}
-
-	// deep logging
-	var copiedResponse *http.Response
-	if RecordDetail(r) {
-		copiedResponse = CopyHttpResponse(newResponse)
+	if !isPre {
+		// Handle response middleware
+		if err := handleResponseChain(spec.ResponseChain, w, newResponse, r, session); err != nil {
+			log.Error("Response chain failed! ", err)
+		}
 	}
 
 	// Clone the response so we can save it
-	copiedRes := new(http.Response)
-	*copiedRes = *newResponse // includes shallow copies of maps, but okay
+	copiedRes := copyResponse(newResponse)
 
-	defer newResponse.Body.Close()
-
-	// Buffer body data
-	var bodyBuffer bytes.Buffer
-	bodyBuffer2 := new(bytes.Buffer)
-
-	io.Copy(&bodyBuffer, newResponse.Body)
-	*bodyBuffer2 = bodyBuffer
-
-	// Create new ReadClosers so we can split output
-	newResponse.Body = ioutil.NopCloser(&bodyBuffer)
-	copiedRes.Body = ioutil.NopCloser(bodyBuffer2)
-
-	d.HandleResponse(w, newResponse, session)
+	handleForcedResponse(w, newResponse, session)
 
 	// Record analytics
-	go d.sh.RecordHit(r, 0, newResponse.StatusCode, copiedRequest, copiedResponse)
-
 	return copiedRes
-
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
@@ -244,12 +239,16 @@ func (d *VirtualEndpoint) ProcessRequest(w http.ResponseWriter, r *http.Request,
 	return nil, mwStatusRespond
 }
 
-func (d *VirtualEndpoint) HandleResponse(rw http.ResponseWriter, res *http.Response, ses *SessionState) error {
+func (d *VirtualEndpoint) HandleResponse(rw http.ResponseWriter, res *http.Response, ses *SessionState) {
+	// Externalising this from the MW so we can re-use it elsewhere
+	handleForcedResponse(rw, res, ses)
+}
 
+func handleForcedResponse(rw http.ResponseWriter, res *http.Response, ses *SessionState) {
 	defer res.Body.Close()
 
 	// Close connections
-	if globalConf.CloseConnections {
+	if config.Global.CloseConnections {
 		res.Header.Set("Connection", "close")
 	}
 
@@ -265,5 +264,4 @@ func (d *VirtualEndpoint) HandleResponse(rw http.ResponseWriter, res *http.Respo
 
 	rw.WriteHeader(res.StatusCode)
 	io.Copy(rw, res.Body)
-	return nil
 }

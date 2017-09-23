@@ -171,15 +171,15 @@ type VersionInfo struct {
 }
 
 type AuthProviderMeta struct {
-	Name          AuthProviderCode  `bson:"name" json:"name"`
-	StorageEngine StorageEngineCode `bson:"storage_engine" json:"storage_engine"`
-	Meta          interface{}       `bson:"meta" json:"meta"`
+	Name          AuthProviderCode       `bson:"name" json:"name"`
+	StorageEngine StorageEngineCode      `bson:"storage_engine" json:"storage_engine"`
+	Meta          map[string]interface{} `bson:"meta" json:"meta"`
 }
 
 type SessionProviderMeta struct {
-	Name          SessionProviderCode `bson:"name" json:"name"`
-	StorageEngine StorageEngineCode   `bson:"storage_engine" json:"storage_engine"`
-	Meta          interface{}         `bson:"meta" json:"meta"`
+	Name          SessionProviderCode    `bson:"name" json:"name"`
+	StorageEngine StorageEngineCode      `bson:"storage_engine" json:"storage_engine"`
+	Meta          map[string]interface{} `bson:"meta" json:"meta"`
 }
 
 type EventHandlerTriggerConfig struct {
@@ -351,7 +351,13 @@ type APIDefinition struct {
 	DoNotTrack        bool                   `bson:"do_not_track" json:"do_not_track"`
 	Tags              []string               `bson:"tags" json:"tags"`
 	EnableContextVars bool                   `bson:"enable_context_vars" json:"enable_context_vars"`
-	RawData           map[string]interface{} `bson:"raw_data,omitempty" json:"raw_data,omitempty"` // Not used in actual configuration, loaded by config for plugable arc
+	ConfigData        map[string]interface{} `bson:"config_data" json:"config_data"`
+	GlobalRateLimit   GlobalRateLimit        `bson:"global_rate_limit" json:"global_rate_limit"`
+}
+
+type GlobalRateLimit struct {
+	Rate float64 `bson:"rate" json:"rate"`
+	Per  float64 `bson:"per" json:"per"`
 }
 
 type BundleManifest struct {

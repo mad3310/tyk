@@ -8,15 +8,15 @@ import (
 
 type Monitor struct{}
 
-func (Monitor) IsMonitorEnabled() bool {
-	return globalConf.Monitor.EnableTriggerMonitors
+func (Monitor) Enabled() bool {
+	return config.Global.Monitor.EnableTriggerMonitors
 }
 
 func (Monitor) Fire(sessionData *SessionState, key string, triggerLimit float64) {
 	em := config.EventMessage{
 		Type: EventTriggerExceeded,
 		Meta: EventTriggerExceededMeta{
-			EventMetaDefault: EventMetaDefault{Message: "Quota trigger reached", OriginatingRequest: ""},
+			EventMetaDefault: EventMetaDefault{Message: "Quota trigger reached"},
 			Org:              sessionData.OrgID,
 			Key:              key,
 			TriggerLimit:     int64(triggerLimit),
@@ -28,7 +28,7 @@ func (Monitor) Fire(sessionData *SessionState, key string, triggerLimit float64)
 }
 
 func (m Monitor) Check(sessionData *SessionState, key string) {
-	if !m.IsMonitorEnabled() || sessionData.QuotaMax == -1 {
+	if !m.Enabled() || sessionData.QuotaMax == -1 {
 		return
 	}
 
@@ -47,13 +47,13 @@ func (m Monitor) Check(sessionData *SessionState, key string) {
 		return
 	}
 
-	if globalConf.Monitor.GlobalTriggerLimit > 0.0 && usagePerc >= globalConf.Monitor.GlobalTriggerLimit {
+	if config.Global.Monitor.GlobalTriggerLimit > 0.0 && usagePerc >= config.Global.Monitor.GlobalTriggerLimit {
 		log.Info("Firing...")
-		m.Fire(sessionData, key, globalConf.Monitor.GlobalTriggerLimit)
+		m.Fire(sessionData, key, config.Global.Monitor.GlobalTriggerLimit)
 	}
 
 	for _, triggerLimit := range sessionData.Monitor.TriggerLimits {
-		if usagePerc >= triggerLimit && triggerLimit != globalConf.Monitor.GlobalTriggerLimit {
+		if usagePerc >= triggerLimit && triggerLimit != config.Global.Monitor.GlobalTriggerLimit {
 			log.Info("Firing...")
 			m.Fire(sessionData, key, triggerLimit)
 			break

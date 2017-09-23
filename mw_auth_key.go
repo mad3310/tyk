@@ -13,10 +13,10 @@ import (
 // KeyExists will check if the key being used to access the API is in the request data,
 // and then if the key is in the storage engine
 type AuthKey struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (k *AuthKey) GetName() string {
+func (k *AuthKey) Name() string {
 	return "AuthKey"
 }
 
@@ -72,7 +72,7 @@ func (k *AuthKey) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inter
 		// No header value, fail
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 		}).Info("Attempted access with malformed header, no auth header found.")
 
 		return errors.New("Authorization field missing"), 401
@@ -86,15 +86,15 @@ func (k *AuthKey) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inter
 	if !keyExists {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 			"key":    key,
 		}).Info("Attempted access with non-existent key.")
 
 		// Fire Authfailed Event
-		AuthFailed(k.BaseMiddleware, r, key)
+		AuthFailed(k, r, key)
 
 		// Report in health check
-		ReportHealthCheckValue(k.Spec.Health, KeyFailure, "1")
+		reportHealthValue(k.Spec, KeyFailure, "1")
 
 		return errors.New("Key not authorised"), 403
 	}
@@ -116,11 +116,11 @@ func stripBearer(token string) string {
 	return strings.TrimSpace(token)
 }
 
-func AuthFailed(m *BaseMiddleware, r *http.Request, token string) {
-	m.FireEvent(EventAuthFailure, EventAuthFailureMeta{
+func AuthFailed(m TykMiddleware, r *http.Request, token string) {
+	m.Base().FireEvent(EventAuthFailure, EventAuthFailureMeta{
 		EventMetaDefault: EventMetaDefault{Message: "Auth Failure", OriginatingRequest: EncodeRequestToEvent(r)},
 		Path:             r.URL.Path,
-		Origin:           GetIPFromRequest(r),
+		Origin:           requestIP(r),
 		Key:              token,
 	})
 }

@@ -3,17 +3,40 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/garyburd/redigo/redis"
 
 	"github.com/TykTechnologies/goverify"
+	"github.com/TykTechnologies/tyk/config"
 )
+
+type NotificationCommand string
 
 const (
 	RedisPubSubChannel = "tyk.cluster.notifications"
+
+	NoticeApiUpdated             NotificationCommand = "ApiUpdated"
+	NoticeApiRemoved             NotificationCommand = "ApiRemoved"
+	NoticeApiAdded               NotificationCommand = "ApiAdded"
+	NoticeGroupReload            NotificationCommand = "GroupReload"
+	NoticePolicyChanged          NotificationCommand = "PolicyChanged"
+	NoticeConfigUpdate           NotificationCommand = "NoticeConfigUpdated"
+	NoticeDashboardZeroConf      NotificationCommand = "NoticeDashboardZeroConf"
+	NoticeDashboardConfigRequest NotificationCommand = "NoticeDashboardConfigRequest"
+	NoticeGatewayConfigResponse  NotificationCommand = "NoticeGatewayConfigResponse"
+	NoticeGatewayDRLNotification NotificationCommand = "NoticeGatewayDRLNotification"
+	NoticeGatewayLENotification  NotificationCommand = "NoticeGatewayLENotification"
 )
+
+// Notification is a type that encodes a message published to a pub sub channel (shared between implementations)
+type Notification struct {
+	Command   NotificationCommand `json:"command"`
+	Payload   string              `json:"payload"`
+	Signature string              `json:"signature"`
+}
 
 func startPubSubLoop() {
 	cacheStore := RedisClusterStorageManager{}
@@ -71,7 +94,7 @@ func handleRedisEvent(v interface{}, handled func(NotificationCommand), reloaded
 	case NoticeDashboardConfigRequest:
 		handleSendMiniConfig(notif.Payload)
 	case NoticeGatewayDRLNotification:
-		if globalConf.ManagementNode {
+		if config.Global.ManagementNode {
 			// DRL is not initialized, going through would
 			// be mostly harmless but would flood the log
 			// with warnings since DRLManager.Ready == false
@@ -97,7 +120,7 @@ func handleRedisEvent(v interface{}, handled func(NotificationCommand), reloaded
 	}
 }
 
-var warnedOnce bool
+var redisInsecureWarn sync.Once
 var notificationVerifier goverify.Verifier
 
 func isPayloadSignatureValid(notification Notification) bool {
@@ -107,26 +130,23 @@ func isPayloadSignatureValid(notification Notification) bool {
 		return true
 	}
 
-	if notification.Signature == "" && globalConf.AllowInsecureConfigs {
-		if !warnedOnce {
+	if notification.Signature == "" && config.Global.AllowInsecureConfigs {
+		redisInsecureWarn.Do(func() {
 			log.WithFields(logrus.Fields{
 				"prefix": "pub-sub",
 			}).Warning("Insecure configuration detected (allowing)!")
-			warnedOnce = true
-		}
+		})
 		return true
 	}
 
-	if globalConf.PublicKeyPath != "" {
-		if notificationVerifier == nil {
-			var err error
-			notificationVerifier, err = goverify.LoadPublicKeyFromFile(globalConf.PublicKeyPath)
-			if err != nil {
-				log.WithFields(logrus.Fields{
-					"prefix": "pub-sub",
-				}).Error("Notification signer: Failed loading private key from path: ", err)
-				return false
-			}
+	if config.Global.PublicKeyPath != "" && notificationVerifier == nil {
+		var err error
+		notificationVerifier, err = goverify.LoadPublicKeyFromFile(config.Global.PublicKeyPath)
+		if err != nil {
+			log.WithFields(logrus.Fields{
+				"prefix": "pub-sub",
+			}).Error("Notification signer: Failed loading private key from path: ", err)
+			return false
 		}
 	}
 
@@ -150,4 +170,25 @@ func isPayloadSignatureValid(notification Notification) bool {
 	}
 
 	return false
+}
+
+// RedisNotifier will use redis pub/sub channels to send notifications
+type RedisNotifier struct {
+	store   *RedisClusterStorageManager
+	channel string
+}
+
+// Notify will send a notification to a channel
+func (r *RedisNotifier) Notify(notification Notification) bool {
+	toSend, err := json.Marshal(notification)
+	if err != nil {
+		log.Error("Problem marshalling notification: ", err)
+		return false
+	}
+	log.Debug("Sending notification", notification)
+	if err := r.store.Publish(r.channel, string(toSend)); err != nil {
+		log.Error("Could not send notification: ", err)
+		return false
+	}
+	return true
 }

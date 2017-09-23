@@ -119,8 +119,8 @@ func EncodeRequestToEvent(r *http.Request) string {
 	return base64.StdEncoding.EncodeToString(asBytes.Bytes())
 }
 
-// GetEventHandlerByName is a convenience function to get event handler instances from an API Definition
-func GetEventHandlerByName(handlerConf apidef.EventHandlerTriggerConfig, spec *APISpec) (config.TykEventHandler, error) {
+// EventHandlerByName is a convenience function to get event handler instances from an API Definition
+func EventHandlerByName(handlerConf apidef.EventHandlerTriggerConfig, spec *APISpec) (config.TykEventHandler, error) {
 
 	conf := handlerConf.HandlerMeta
 	switch handlerConf.Handler {
@@ -157,11 +157,6 @@ func GetEventHandlerByName(handlerConf apidef.EventHandlerTriggerConfig, spec *A
 	return nil, errors.New("Handler not found")
 }
 
-// FireEvent is added to the BaseMiddleware object so it is available across the entire stack
-func (t *BaseMiddleware) FireEvent(name apidef.TykEvent, meta interface{}) {
-	fireEvent(name, meta, t.Spec.EventPaths)
-}
-
 func fireEvent(name apidef.TykEvent, meta interface{}, handlers map[apidef.TykEvent][]config.TykEventHandler) {
 	if handlers, e := handlers[name]; e {
 		eventMessage := config.EventMessage{
@@ -180,7 +175,7 @@ func (s *APISpec) FireEvent(name apidef.TykEvent, meta interface{}) {
 }
 
 func FireSystemEvent(name apidef.TykEvent, meta interface{}) {
-	fireEvent(name, meta, globalConf.EventTriggers)
+	fireEvent(name, meta, config.Global.EventTriggers)
 }
 
 // LogMessageEventHandler is a sample Event Handler
@@ -218,7 +213,7 @@ func InitGenericEventHandlers(theseEvents apidef.EventHandlerMetaConfig) map[api
 		log.Debug("FOUND EVENTS TO INIT")
 		for _, handlerConf := range eventHandlerConfs {
 			log.Debug("CREATING EVENT HANDLERS")
-			eventHandlerInstance, err := GetEventHandlerByName(handlerConf, nil)
+			eventHandlerInstance, err := EventHandlerByName(handlerConf, nil)
 
 			if err != nil {
 				log.Error("Failed to init event handler: ", err)

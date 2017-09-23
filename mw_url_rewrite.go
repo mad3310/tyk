@@ -11,13 +11,14 @@ import (
 	"github.com/TykTechnologies/tyk/apidef"
 )
 
-func urlRewrite(meta *apidef.URLRewriteMeta, path string, r *http.Request) (string, error) {
+func urlRewrite(meta *apidef.URLRewriteMeta, r *http.Request) (string, error) {
 	// Find all the matching groups:
 	mp, err := regexp.Compile(meta.MatchPattern)
 	if err != nil {
 		log.Debug("Compilation error: ", err)
 		return "", err
 	}
+	path := r.URL.String()
 	log.Debug("Inbound path: ", path)
 	newpath := path
 
@@ -112,14 +113,14 @@ func valToStr(v interface{}) string {
 
 // URLRewriteMiddleware Will rewrite an inbund URL to a matching outbound one, it can also handle dynamic variable substitution
 type URLRewriteMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (m *URLRewriteMiddleware) GetName() string {
+func (m *URLRewriteMiddleware) Name() string {
 	return "URLRewriteMiddleware"
 }
 
-func (m *URLRewriteMiddleware) IsEnabledForSpec() bool {
+func (m *URLRewriteMiddleware) EnabledForSpec() bool {
 	for _, version := range m.Spec.VersionData.Versions {
 		if len(version.ExtendedPaths.URLRewrite) > 0 {
 			m.Spec.URLRewriteEnabled = true
@@ -140,8 +141,8 @@ func (m *URLRewriteMiddleware) CheckHostRewrite(oldPath, newTarget string, r *ht
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (m *URLRewriteMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	_, versionPaths, _, _ := m.Spec.GetVersionData(r)
-	found, meta := m.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, URLRewrite)
+	_, versionPaths, _, _ := m.Spec.Version(r)
+	found, meta := m.Spec.CheckSpecMatchesStatus(r, versionPaths, URLRewrite)
 	if !found {
 		return nil, 200
 	}
@@ -150,7 +151,7 @@ func (m *URLRewriteMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Req
 	umeta := meta.(*apidef.URLRewriteMeta)
 	log.Debug(r.URL)
 	oldPath := r.URL.String()
-	p, err := urlRewrite(umeta, r.URL.String(), r)
+	p, err := urlRewrite(umeta, r)
 	if err != nil {
 		return err, 500
 	}

@@ -13,10 +13,10 @@ import (
 // Oauth2KeyExists will check if the key being used to access the API is in the request data,
 // and then if the key is in the storage engine
 type Oauth2KeyExists struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (k *Oauth2KeyExists) GetName() string {
+func (k *Oauth2KeyExists) Name() string {
 	return "Oauth2KeyExists"
 }
 
@@ -29,7 +29,7 @@ func (k *Oauth2KeyExists) ProcessRequest(w http.ResponseWriter, r *http.Request,
 	if len(parts) < 2 {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 		}).Info("Attempted access with malformed header, no auth header found.")
 
 		return errors.New("Authorization field missing"), 400
@@ -38,7 +38,7 @@ func (k *Oauth2KeyExists) ProcessRequest(w http.ResponseWriter, r *http.Request,
 	if strings.ToLower(parts[0]) != "bearer" {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 		}).Info("Bearer token malformed")
 
 		return errors.New("Bearer token malformed"), 400
@@ -50,14 +50,14 @@ func (k *Oauth2KeyExists) ProcessRequest(w http.ResponseWriter, r *http.Request,
 	if !keyExists {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 			"key":    accessToken,
 		}).Info("Attempted access with non-existent key.")
 
 		// Fire Authfailed Event
-		AuthFailed(k.BaseMiddleware, r, accessToken)
+		AuthFailed(k, r, accessToken)
 		// Report in health check
-		ReportHealthCheckValue(k.Spec.Health, KeyFailure, "-1")
+		reportHealthValue(k.Spec, KeyFailure, "-1")
 
 		return errors.New("Key not authorised"), 403
 	}

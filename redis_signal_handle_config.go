@@ -19,7 +19,7 @@ type ConfigPayload struct {
 }
 
 func backupConfiguration() error {
-	oldConfig, err := json.MarshalIndent(globalConf, "", "    ")
+	oldConfig, err := json.MarshalIndent(config.Global, "", "    ")
 	if err != nil {
 		return err
 	}
@@ -64,14 +64,14 @@ func handleNewConfiguration(payload string) {
 	}
 
 	// Make sure payload matches nodeID and hostname
-	if configPayload.ForHostname != HostDetails.Hostname && configPayload.ForNodeID != NodeID {
+	if configPayload.ForHostname != hostDetails.Hostname && configPayload.ForNodeID != NodeID {
 		log.WithFields(logrus.Fields{
 			"prefix": "pub-sub",
 		}).Info("Configuration update received, no NodeID/Hostname match found")
 		return
 	}
 
-	if globalConf.AllowRemoteConfig {
+	if config.Global.AllowRemoteConfig {
 		log.WithFields(logrus.Fields{
 			"prefix": "pub-sub",
 		}).Warning("Ignoring new config: Remote configuration is not allowed for this node.")
@@ -100,7 +100,7 @@ func handleNewConfiguration(payload string) {
 }
 
 func reloadConfiguration() {
-	myPID := HostDetails.PID
+	myPID := hostDetails.PID
 	if myPID == 0 {
 		log.Error("No PID found, cannot reload")
 		return

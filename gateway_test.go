@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/justinas/alice"
 
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/config"
 )
 
@@ -131,32 +133,35 @@ func TestMain(m *testing.M) {
 	go func() {
 		panic(testServer.ListenAndServe())
 	}()
-	config.WriteDefault("", &globalConf)
-	globalConf.Storage.Database = 1
+	config.WriteDefault("", &config.Global)
+	config.Global.Storage.Database = 1
 	if err := emptyRedis(); err != nil {
 		panic(err)
 	}
 	var err error
-	globalConf.AppPath, err = ioutil.TempDir("", "tyk-test-")
+	config.Global.AppPath, err = ioutil.TempDir("", "tyk-test-")
 	if err != nil {
 		panic(err)
 	}
-	globalConf.EnableAnalytics = true
-	globalConf.AnalyticsConfig.EnableGeoIP = true
-	globalConf.AnalyticsConfig.GeoIPDBLocation = filepath.Join("/root/goprojects/src/github.com/TykTechnologies/tyk/testdata", "MaxMind-DB-test-ipv4-24.mmdb")
-	globalConf.EnableJSVM = true
-	globalConf.Monitor.EnableTriggerMonitors = true
-	globalConf.AnalyticsConfig.NormaliseUrls.Enabled = true
-	globalConf.TemplatePath = "/etc/tyk/templates"
-	globalConf.MiddlewarePath = "/etc/tyk/middleware"
-	globalConf.TykJSPath = "/etc/tyk/js/tyk.js"
-	afterConfSetup(&globalConf)
+	config.Global.EnableAnalytics = true
+	config.Global.AnalyticsConfig.EnableGeoIP = true
+	config.Global.AnalyticsConfig.GeoIPDBLocation = filepath.Join("/root/goprojects/src/github.com/TykTechnologies/tyk/testdata", "MaxMind-DB-test-ipv4-24.mmdb")
+	config.Global.EnableJSVM = true
+	config.Global.Monitor.EnableTriggerMonitors = true
+	config.Global.AnalyticsConfig.NormaliseUrls.Enabled = true
+	config.Global.TemplatePath = "/etc/tyk/templates"
+	config.Global.MiddlewarePath = "/etc/tyk/middleware"
+	config.Global.TykJSPath = "/etc/tyk/js/tyk.js"
+	afterConfSetup(&config.Global)
 	initialiseSystem(nil)
+	// Small part of start()
+	loadAPIEndpoints(mainRouter)
 	if analytics.GeoIPDB == nil {
 		panic("GeoIPDB was not initialized")
 	}
 
 	go reloadLoop(reloadTick)
+	go reloadQueueLoop()
 
 	go func() {
 		// simulate reloads in the background, i.e. writes to
@@ -177,18 +182,18 @@ func TestMain(m *testing.M) {
 
 	exitCode := m.Run()
 
-	os.RemoveAll(globalConf.AppPath)
+	os.RemoveAll(config.Global.AppPath)
 	os.Exit(exitCode)
 }
 
 func emptyRedis() error {
-	addr := ":" + strconv.Itoa(globalConf.Storage.Port)
+	addr := config.Global.Storage.Host + ":" + strconv.Itoa(config.Global.Storage.Port)
 	c, err := redis.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("could not connect to redis: %v", err)
 	}
 	defer c.Close()
-	dbName := strconv.Itoa(globalConf.Storage.Database)
+	dbName := strconv.Itoa(config.Global.Storage.Database)
 	if _, err := c.Do("SELECT", dbName); err != nil {
 		return err
 	}
@@ -274,8 +279,8 @@ type tykErrorResponse struct {
 // ProxyHandler Proxies requests through to their final destination, if they make it through the middleware chain.
 func ProxyHandler(p *ReverseProxy, apiSpec *APISpec) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tm := BaseMiddleware{apiSpec, p}
-		handler := SuccessHandler{&tm}
+		baseMid := BaseMiddleware{apiSpec, p}
+		handler := SuccessHandler{baseMid}
 		// Skip all other execution
 		handler.ServeHTTP(w, r)
 	})
@@ -285,30 +290,27 @@ func getChain(spec *APISpec) http.Handler {
 	remote, _ := url.Parse(spec.Proxy.TargetURL)
 	proxy := TykNewSingleHostReverseProxy(remote, spec)
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := &BaseMiddleware{spec, proxy}
-	chain := alice.New(
-		CreateMiddleware(&IPWhiteListMiddleware{baseMid}, baseMid),
-		CreateMiddleware(&MiddlewareContextVars{BaseMiddleware: baseMid}, baseMid),
-		CreateMiddleware(&AuthKey{baseMid}, baseMid),
-		CreateMiddleware(&VersionCheck{BaseMiddleware: baseMid}, baseMid),
-		CreateMiddleware(&KeyExpired{baseMid}, baseMid),
-		CreateMiddleware(&AccessRightsCheck{baseMid}, baseMid),
-		CreateMiddleware(&RateLimitAndQuotaCheck{baseMid}, baseMid),
-		CreateMiddleware(&TransformHeaders{baseMid}, baseMid)).Then(proxyHandler)
-
+	baseMid := BaseMiddleware{spec, proxy}
+	chain := alice.New(mwList(
+		&IPWhiteListMiddleware{baseMid},
+		&MiddlewareContextVars{BaseMiddleware: baseMid},
+		&AuthKey{baseMid},
+		&VersionCheck{BaseMiddleware: baseMid},
+		&KeyExpired{baseMid},
+		&AccessRightsCheck{baseMid},
+		&RateLimitAndQuotaCheck{baseMid},
+		&TransformHeaders{baseMid},
+	)...).Then(proxyHandler)
 	return chain
 }
 
 const nonExpiringDefNoWhiteList = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
@@ -348,19 +350,14 @@ const nonExpiringDefNoWhiteList = `{
 
 const versionedDefinition = `{
 	"api_id": "9991",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"versions": {
-			"v1": {
-				"name": "v1"
-			}
+			"v1": {"name": "v1"}
 		}
 	},
 	"event_handlers": {
@@ -393,7 +390,6 @@ const versionedDefinition = `{
 
 const pathBasedDefinition = `{
 	"api_id": "9992",
-	"org_id": "default",
 	"auth": {
 		"use_param": true,
 		"auth_header_name": "authorization"
@@ -414,19 +410,16 @@ const pathBasedDefinition = `{
 
 const extendedPathGatewaySetup = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
-			"Default": {
-				"name": "Default",
+			"v1": {
+				"name": "v1",
 				"use_extended_paths": true,
 				"extended_paths": {
 					"ignored": [
@@ -782,7 +775,6 @@ type tykHttpTest struct {
 	code         int
 	body         interface{}
 
-	afterFn        func()
 	adminAuth      bool
 	controlRequest bool
 }
@@ -801,22 +793,24 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 	for _, m := range testMatrix {
 		var ln, cln net.Listener
 
-		ln, _ = net.Listen("tcp", ":0")
+		ln, _ = net.Listen("tcp", "127.0.0.1:0")
 
 		if separateControlPort {
-			cln, _ = net.Listen("tcp", ":0")
+			cln, _ = net.Listen("tcp", "127.0.0.1:0")
 
 			_, port, _ := net.SplitHostPort(cln.Addr().String())
-			globalConf.ControlAPIPort, _ = strconv.Atoi(port)
+			config.Global.ControlAPIPort, _ = strconv.Atoi(port)
+		} else {
+			config.Global.ControlAPIPort = 0
 		}
 
-		globalConf.HttpServerOptions.OverrideDefaults = m.overrideDefaults
+		config.Global.HttpServerOptions.OverrideDefaults = m.overrideDefaults
 
 		// Ensure that no local API's installed
-		os.RemoveAll(globalConf.AppPath)
+		os.RemoveAll(config.Global.AppPath)
 
 		var err error
-		globalConf.AppPath, err = ioutil.TempDir("", "tyk-test-")
+		config.Global.AppPath, err = ioutil.TempDir("", "tyk-test-")
 		if err != nil {
 			panic(err)
 		}
@@ -824,8 +818,8 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 		setupGlobals()
 		// This is emulate calling start()
 		// But this lines is the only thing needed for this tests
-		if globalConf.ControlAPIPort == 0 {
-			loadAPIEndpoints(defaultRouter)
+		if config.Global.ControlAPIPort == 0 {
+			loadAPIEndpoints(mainRouter)
 		}
 
 		if m.goagain {
@@ -833,8 +827,6 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 		} else {
 			listen(ln, cln, fmt.Errorf("Without goagain"))
 		}
-
-		client := &http.Client{}
 
 		for ti, tc := range tests {
 			tPrefix := ""
@@ -868,18 +860,15 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 				req = withAuth(req)
 			}
 
-			resp, err := client.Do(req)
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Error(err)
 				continue
 			}
+			resp.Body.Close()
 
 			if resp.StatusCode != tc.code {
 				t.Errorf("[%d]%s%s %s Status %d, want %d", ti, tPrefix, tc.method, tc.path, resp.StatusCode, tc.code)
-			}
-
-			if tc.afterFn != nil {
-				tc.afterFn()
 			}
 		}
 
@@ -892,38 +881,41 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 }
 
 const sampleAPI = `{
-	"slug": "api",
 	"api_id": "test",
 	"use_keyless": true,
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
-			"Default": {
-				"name": "Default"
-			}
+			"v1": {"name": "v1"}
 		}
 	},
 	"proxy": {
-		"listen_path": "/",
-		"target_url": "http://127.0.0.1:16500"
-	},
-	"active": true
+		"listen_path": "/sample",
+		"target_url": "` + testHttpAny + `"
+	}
 }`
 
 func TestListener(t *testing.T) {
 	tests := []tykHttpTest{
-		{method: "GET", path: "/", code: 404},
+		{method: "GET", path: "/sample", code: 404},
 		{method: "GET", path: "/tyk/apis/", code: 403},
 		{method: "GET", path: "/tyk/apis/", adminAuth: true, code: 200},
 		{method: "GET", path: "/tyk/apis", code: 403},
 		{method: "GET", path: "/tyk/apis", adminAuth: true, code: 200},
 		{method: "POST", path: "/tyk/apis", body: sampleAPI, adminAuth: true, code: 200},
 		// API definitions not reloaded yet
-		{method: "GET", path: "/", code: 404},
-		{method: "GET", path: "/tyk/reload/", adminAuth: true, code: 200, afterFn: func() { doReload() }},
-		{method: "GET", path: "/", code: 200},
+		{method: "GET", path: "/sample", code: 404},
+		{method: "GET", path: "/tyk/reload/?block=true", adminAuth: true, code: 200},
+		{method: "GET", path: "/sample", code: 200},
 	}
 
+	// have all needed reload ticks ready
+	go func() {
+		// two calls to testHttp, each loops over tests 4 times
+		for i := 0; i < 2*4; i++ {
+			reloadTick <- time.Time{}
+		}
+	}()
 	testHttp(t, tests, false)
 	doReload()
 	testHttp(t, tests, false)
@@ -948,9 +940,9 @@ func TestControlListener(t *testing.T) {
 
 func TestManagementNodeRedisEvents(t *testing.T) {
 	defer func() {
-		globalConf.ManagementNode = false
+		config.Global.ManagementNode = false
 	}()
-	globalConf.ManagementNode = false
+	config.Global.ManagementNode = false
 	msg := redis.Message{
 		Data: []byte(`{"Command": "NoticeGatewayDRLNotification"}`),
 	}
@@ -960,9 +952,135 @@ func TestManagementNodeRedisEvents(t *testing.T) {
 		}
 	}
 	handleRedisEvent(msg, shouldHandle, nil)
-	globalConf.ManagementNode = true
+	config.Global.ManagementNode = true
 	notHandle := func(got NotificationCommand) {
 		t.Fatalf("should have not handled redis event")
 	}
 	handleRedisEvent(msg, notHandle, nil)
+}
+
+const apiWithTykListenPathPrefix = `{
+	"api_id": "test",
+	"use_keyless": true,
+	"version_data": {
+		"not_versioned": true,
+		"versions": {"v1": {"name": "v1"}}
+	},
+	"proxy": {
+		"listen_path": "/tyk-foo/",
+		"target_url": "` + testHttpAny + `"
+	}
+}`
+
+func TestListenPathTykPrefix(t *testing.T) {
+	tests := []tykHttpTest{
+		{method: "POST", path: "/tyk/apis", body: apiWithTykListenPathPrefix, adminAuth: true, code: 200},
+		{method: "GET", path: "/tyk-foo/", code: 404},
+		{method: "GET", path: "/tyk/reload/?block=true", adminAuth: true, code: 200},
+		{method: "GET", path: "/tyk-foo/", code: 200},
+	}
+	// have all needed reload ticks ready
+	go func() {
+		// one call to testHttp, each loops over tests 4 times
+		for i := 0; i < 1*4; i++ {
+			reloadTick <- time.Time{}
+		}
+	}()
+	testHttp(t, tests, false)
+}
+
+func TestProxyUserAgent(t *testing.T) {
+	spec := createSpecTest(t, sampleAPI)
+	remote, _ := url.Parse(spec.Proxy.TargetURL)
+	proxy := TykNewSingleHostReverseProxy(remote, spec)
+	proxyHandler := ProxyHandler(proxy, spec)
+
+	tests := []struct {
+		sent   interface{}
+		wantRe string
+	}{
+		// none set; use our default
+		{nil, `^Tyk/v\d+\.\d+\.\d+$`},
+		// set but empty; let it through
+		{"", `^$`},
+		// set and not empty
+		{"SomeAgent", `^SomeAgent$`},
+	}
+	for _, tc := range tests {
+		rec := httptest.NewRecorder()
+		req := testReq(t, "GET", "/sample", nil)
+		if s, ok := tc.sent.(string); ok {
+			req.Header.Set("User-Agent", s)
+		}
+
+		proxyHandler.ServeHTTP(rec, req)
+
+		if rec.Code != 200 {
+			t.Error("Initial request failed with non-200 code: ", rec.Code)
+			t.Error(rec.Body)
+		}
+
+		var resp testHttpResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatal("JSON decoding failed:", err)
+		}
+
+		rx := regexp.MustCompile(tc.wantRe)
+		if got := resp.Headers["User-Agent"]; !rx.MatchString(got) {
+			t.Errorf("Wanted agent to match %q, got %q\n", tc.wantRe, got)
+		}
+	}
+}
+
+func buildAndLoadAPI(apiGens ...func(spec *APISpec)) {
+	oldPath := config.Global.AppPath
+	config.Global.AppPath, _ = ioutil.TempDir("", "apps")
+	defer func() {
+		os.RemoveAll(config.Global.AppPath)
+		config.Global.AppPath = oldPath
+	}()
+
+	for i, gen := range apiGens {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		json.Unmarshal([]byte(sampleAPI), spec.APIDefinition)
+		gen(spec)
+		specBytes, _ := json.Marshal(spec)
+		specFilePath := filepath.Join(config.Global.AppPath, spec.APIID+strconv.Itoa(i)+".json")
+		if err := ioutil.WriteFile(specFilePath, specBytes, 0644); err != nil {
+			panic(err)
+		}
+	}
+
+	doReload()
+}
+
+func TestSkipUrlCleaning(t *testing.T) {
+	config.Global.HttpServerOptions.OverrideDefaults = true
+	config.Global.HttpServerOptions.SkipURLCleaning = true
+
+	ln, _ := generateListener(0)
+	baseURL := "http://" + ln.Addr().String()
+	listen(ln, nil, nil)
+
+	defer func() {
+		config.Global.HttpServerOptions.OverrideDefaults = false
+		config.Global.HttpServerOptions.SkipURLCleaning = false
+		ln.Close()
+	}()
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.URL.Path))
+	}))
+
+	buildAndLoadAPI(func(spec *APISpec) {
+		spec.Proxy.ListenPath = "/"
+		spec.Proxy.TargetURL = s.URL
+	})
+
+	resp, _ := http.Get(baseURL + "/http://example.com")
+	body, _ := ioutil.ReadAll(resp.Body)
+
+	if string(body) != "/http://example.com" {
+		t.Error("Should not strip URL", string(body))
+	}
 }

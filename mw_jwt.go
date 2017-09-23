@@ -6,23 +6,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/dgrijalva/jwt-go"
-	"github.com/pmylund/go-cache"
+	cache "github.com/pmylund/go-cache"
 
 	"github.com/TykTechnologies/tyk/apidef"
 )
 
 type JWTMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (k *JWTMiddleware) GetName() string {
+func (k *JWTMiddleware) Name() string {
 	return "JWTMiddleware"
 }
 
@@ -55,21 +54,15 @@ func (k *JWTMiddleware) getSecretFromURL(url, kid, keyType string) ([]byte, erro
 	if !found {
 		// Get the JWK
 		log.Debug("Pulling JWK")
-		response, err := http.Get(url)
+		resp, err := http.Get(url)
 		if err != nil {
 			log.Error("Failed to get resource URL: ", err)
 			return nil, err
 		}
+		defer resp.Body.Close()
 
 		// Decode it
-		defer response.Body.Close()
-		contents, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			log.Error("Failed to read body data: ", err)
-			return nil, err
-		}
-
-		if err := json.Unmarshal(contents, &jwkSet); err != nil {
+		if err := json.NewDecoder(resp.Body).Decode(&jwkSet); err != nil {
 			log.Error("Failed to decode body JWK: ", err)
 			return nil, err
 		}
@@ -111,11 +104,9 @@ func (k *JWTMiddleware) getIdentityFomToken(token *jwt.Token) (string, bool) {
 		idFound = true
 	}
 
-	if !idFound {
-		if token.Claims.(jwt.MapClaims)["sub"] != nil {
-			tykId = token.Claims.(jwt.MapClaims)["sub"].(string)
-			idFound = true
-		}
+	if !idFound && token.Claims.(jwt.MapClaims)["sub"] != nil {
+		tykId = token.Claims.(jwt.MapClaims)["sub"].(string)
+		idFound = true
 	}
 
 	log.Debug("Found: ", tykId)
@@ -237,7 +228,7 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 
 		if err == nil {
 			session = newSession
-			session.MetaData = map[string]string{"TykJWTSessionID": sessionID}
+			session.MetaData = map[string]interface{}{"TykJWTSessionID": sessionID}
 			session.Alias = baseFieldData
 
 			// Update the session in the session manager in case it gets called again
@@ -270,10 +261,10 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 
 func (k *JWTMiddleware) reportLoginFailure(tykId string, r *http.Request) {
 	// Fire Authfailed Event
-	AuthFailed(k.BaseMiddleware, r, tykId)
+	AuthFailed(k, r, tykId)
 
 	// Report in health check
-	ReportHealthCheckValue(k.Spec.Health, KeyFailure, "1")
+	reportHealthValue(k.Spec, KeyFailure, "1")
 }
 
 func (k *JWTMiddleware) processOneToOneTokenMap(r *http.Request, token *jwt.Token) (error, int) {
@@ -322,7 +313,7 @@ func (k *JWTMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _
 		// No header value, fail
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 		}).Info("Attempted access with malformed header, no JWT auth header found.")
 
 		log.Debug("Looked in: ", config.AuthHeaderName)
@@ -390,13 +381,13 @@ func (k *JWTMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _
 	}
 	log.WithFields(logrus.Fields{
 		"path":   r.URL.Path,
-		"origin": GetIPFromRequest(r),
+		"origin": requestIP(r),
 	}).Info("Attempted JWT access with non-existent key.")
 
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 		}).Error("JWT validation error: ", err)
 	}
 

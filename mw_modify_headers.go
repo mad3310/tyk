@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -9,7 +10,7 @@ import (
 
 // TransformMiddleware is a middleware that will apply a template to a request body to transform it's contents ready for an upstream API
 type TransformHeaders struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
 const (
@@ -17,11 +18,11 @@ const (
 	contextLabel = "$tyk_context."
 )
 
-func (t *TransformHeaders) GetName() string {
+func (t *TransformHeaders) Name() string {
 	return "TransformHeaders"
 }
 
-func (t *TransformHeaders) IsEnabledForSpec() bool {
+func (t *TransformHeaders) EnabledForSpec() bool {
 	for _, version := range t.Spec.VersionData.Versions {
 		if len(version.ExtendedPaths.TransformHeader) > 0 ||
 			len(version.GlobalHeaders) > 0 ||
@@ -46,9 +47,11 @@ func (t *TransformHeaders) iterateAddHeaders(kv map[string]string, r *http.Reque
 			// Using meta_data key
 			if session != nil {
 				metaKey := strings.Replace(nVal, metaLabel, "", 1)
-				metaVal, ok := session.MetaData[metaKey]
+				tempVal, ok := session.MetaData[metaKey]
 				if ok {
-					r.Header.Set(nKey, metaVal)
+					// TODO: do a better job than fmt's %v
+					nVal = fmt.Sprintf("%v", tempVal)
+					r.Header.Set(nKey, nVal)
 				} else {
 					log.Warning("Session Meta Data not found for key in map: ", metaKey)
 				}
@@ -74,7 +77,7 @@ func (t *TransformHeaders) iterateAddHeaders(kv map[string]string, r *http.Reque
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (t *TransformHeaders) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	vInfo, versionPaths, _, _ := t.Spec.GetVersionData(r)
+	vInfo, versionPaths, _, _ := t.Spec.Version(r)
 
 	// Manage global headers first - remove
 	for _, gdKey := range vInfo.GlobalHeadersRemove {
@@ -87,7 +90,7 @@ func (t *TransformHeaders) ProcessRequest(w http.ResponseWriter, r *http.Request
 		t.iterateAddHeaders(vInfo.GlobalHeaders, r)
 	}
 
-	found, meta := t.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, HeaderInjected)
+	found, meta := t.Spec.CheckSpecMatchesStatus(r, versionPaths, HeaderInjected)
 	if found {
 		hmeta := meta.(*apidef.HeaderInjectionMeta)
 		for _, dKey := range hmeta.DeleteHeaders {

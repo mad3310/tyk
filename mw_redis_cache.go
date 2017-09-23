@@ -21,12 +21,12 @@ const (
 
 // RedisCacheMiddleware is a caching middleware that will pull data from Redis instead of the upstream proxy
 type RedisCacheMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 	CacheStore StorageHandler
 	sh         SuccessHandler
 }
 
-func (m *RedisCacheMiddleware) GetName() string {
+func (m *RedisCacheMiddleware) Name() string {
 	return "RedisCacheMiddleware"
 }
 
@@ -34,7 +34,10 @@ func (m *RedisCacheMiddleware) Init() {
 	m.sh = SuccessHandler{m.BaseMiddleware}
 }
 
-func (m *RedisCacheMiddleware) IsEnabledForSpec() bool {
+func (m *RedisCacheMiddleware) EnabledForSpec() bool {
+	if !m.Spec.CacheOptions.EnableCache {
+		return false
+	}
 	for _, version := range m.Spec.VersionData.Versions {
 		if len(version.ExtendedPaths.Cached) > 0 {
 			return true
@@ -102,10 +105,6 @@ func (m *RedisCacheMiddleware) decodePayload(payload string) (string, string, er
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (m *RedisCacheMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
 
-	// Allow global cache disabe
-	if !m.Spec.CacheOptions.EnableCache {
-		return nil, 200
-	}
 	// Only allow idempotent (safe) methods
 	if r.Method != "GET" && r.Method != "HEAD" {
 		return nil, 200
@@ -118,9 +117,9 @@ func (m *RedisCacheMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Req
 		stat = StatusCached
 	} else {
 		// New request checker, more targeted, less likely to fail
-		_, versionPaths, _, _ := m.Spec.GetVersionData(r)
-		found, _ := m.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, Cached)
-		isVirtual, _ = m.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, VirtualPath)
+		_, versionPaths, _, _ := m.Spec.Version(r)
+		found, _ := m.Spec.CheckSpecMatchesStatus(r, versionPaths, Cached)
+		isVirtual, _ = m.Spec.CheckSpecMatchesStatus(r, versionPaths, VirtualPath)
 		if found {
 			stat = StatusCached
 		}
@@ -134,12 +133,12 @@ func (m *RedisCacheMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Req
 
 	// No authentication data? use the IP.
 	if token == "" {
-		token = GetIPFromRequest(r)
+		token = requestIP(r)
 	}
 
 	var copiedRequest *http.Request
-	if RecordDetail(r) {
-		copiedRequest = CopyHttpRequest(r)
+	if recordDetail(r) {
+		copiedRequest = copyRequest(r)
 	}
 
 	key := m.CreateCheckSum(r, token)

@@ -5,6 +5,7 @@ import (
 
 	"github.com/TykTechnologies/goverify"
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 
 	"archive/zip"
 	"bytes"
@@ -24,7 +25,7 @@ import (
 var tykBundlePath string
 
 func init() {
-	tykBundlePath = filepath.Join(globalConf.MiddlewarePath, "middleware", "bundles")
+	tykBundlePath = filepath.Join(config.Global.MiddlewarePath, "middleware", "bundles")
 }
 
 // Bundle is the basic bundle data structure, it holds the bundle name and the data.
@@ -46,14 +47,14 @@ func (b *Bundle) Verify() error {
 	var bundleVerifier goverify.Verifier
 
 	// Perform signature verification if a public key path is set:
-	if globalConf.PublicKeyPath != "" {
+	if config.Global.PublicKeyPath != "" {
 		if b.Manifest.Signature == "" {
 			// Error: A public key is set, but the bundle isn't signed.
 			return errors.New("Bundle isn't signed")
 		}
 		if notificationVerifier == nil {
 			var err error
-			bundleVerifier, err = goverify.LoadPublicKeyFromFile(globalConf.PublicKeyPath)
+			bundleVerifier, err = goverify.LoadPublicKeyFromFile(config.Global.PublicKeyPath)
 			if err != nil {
 				return err
 			}
@@ -65,14 +66,17 @@ func (b *Bundle) Verify() error {
 	var bundleData bytes.Buffer
 
 	for _, f := range b.Manifest.FileList {
-		extractedFilePath := filepath.Join(b.Path, f)
+		extractedPath := filepath.Join(b.Path, f)
 
-		data, err := ioutil.ReadFile(extractedFilePath)
+		f, err := os.Open(extractedPath)
 		if err != nil {
-			break
+			return err
 		}
-
-		bundleData.Write(data)
+		_, err = io.Copy(&bundleData, f)
+		f.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	checksum := fmt.Sprintf("%x", md5.Sum(bundleData.Bytes()))
@@ -173,7 +177,7 @@ func (ZipBundleSaver) Save(bundle *Bundle, bundlePath string, spec *APISpec) err
 // fetchBundle will fetch a given bundle, using the right BundleGetter. The first argument is the bundle name, the base bundle URL will be used as prefix.
 func fetchBundle(spec *APISpec) (bundle Bundle, err error) {
 
-	if !globalConf.EnableBundleDownloader {
+	if !config.Global.EnableBundleDownloader {
 		log.WithFields(logrus.Fields{
 			"prefix": "main",
 		}).Warning("Bundle downloader is disabled.")
@@ -181,13 +185,17 @@ func fetchBundle(spec *APISpec) (bundle Bundle, err error) {
 		return bundle, err
 	}
 
-	bundleURL := globalConf.BundleBaseURL + spec.CustomMiddlewareBundle
+	bundleURL := config.Global.BundleBaseURL + spec.CustomMiddlewareBundle
 
 	var getter BundleGetter
 
 	u, err := url.Parse(bundleURL)
 	switch u.Scheme {
 	case "http":
+		getter = &HTTPBundleGetter{
+			URL: bundleURL,
+		}
+	case "https":
 		getter = &HTTPBundleGetter{
 			URL: bundleURL,
 		}
@@ -263,7 +271,7 @@ func loadBundle(spec *APISpec) {
 	}
 
 	// Skip if no bundle base URL is set.
-	if globalConf.BundleBaseURL == "" {
+	if config.Global.BundleBaseURL == "" {
 		bundleError(spec, nil, "No bundle base URL set, skipping bundle")
 		return
 	}

@@ -2,7 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// HTTP reverse proxy handler
+// Fork of Go's net/http/httputil/reverseproxy.go with multiple changes,
+// including:
+//
+// * caching
+// * load balancing
+// * service discovery
 
 package main
 
@@ -10,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -22,21 +28,24 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/pmylund/go-cache"
+	cache "github.com/pmylund/go-cache"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 )
+
+const defaultUserAgent = "Tyk/" + VERSION
 
 var ServiceCache *cache.Cache
 
-func GetURLFromService(spec *APISpec) (*apidef.HostList, error) {
+func urlFromService(spec *APISpec) (*apidef.HostList, error) {
 
 	doCacheRefresh := func() (*apidef.HostList, error) {
 		log.Debug("--> Refreshing")
 		spec.ServiceRefreshInProgress = true
 		sd := ServiceDiscovery{}
-		sd.New(&spec.Proxy.ServiceDiscovery)
-		data, err := sd.GetTarget(spec.Proxy.ServiceDiscovery.QueryEndpoint)
+		sd.Init(&spec.Proxy.ServiceDiscovery)
+		data, err := sd.Target(spec.Proxy.ServiceDiscovery.QueryEndpoint)
 		if err != nil {
 			spec.ServiceRefreshInProgress = false
 			return nil, err
@@ -97,37 +106,30 @@ func EnsureTransport(host string) string {
 	return "http://" + host
 }
 
-func GetNextTarget(targetData *apidef.HostList, spec *APISpec) string {
+func nextTarget(targetData *apidef.HostList, spec *APISpec) (string, error) {
 	if spec.Proxy.EnableLoadBalancing {
 		log.Debug("[PROXY] [LOAD BALANCING] Load balancer enabled, getting upstream target")
 		// Use a HostList
-		// TODO: do better than a mutex to avoid contention
-		spec.RoundRobin.Lock()
-		spec.RoundRobin.SetLen(targetData.Len())
-		startPos := spec.RoundRobin.GetPos()
-		spec.RoundRobin.Unlock()
-
+		startPos := spec.RoundRobin.WithLen(targetData.Len())
 		pos := startPos
 		for {
 			gotHost, err := targetData.GetIndex(pos)
 			if err != nil {
-				log.Error("[PROXY] [LOAD BALANCING] ", err)
-				return gotHost
+				return "", err
 			}
 
 			host := EnsureTransport(gotHost)
 
 			if !spec.Proxy.CheckHostAgainstUptimeTests {
-				return host // we don't care if it's up
+				return host, nil // we don't care if it's up
 			}
-			if !GlobalHostChecker.IsHostDown(host) {
-				return host // we do care and it's up
+			if !GlobalHostChecker.HostDown(host) {
+				return host, nil // we do care and it's up
 			}
 			// if the host is down, keep trying all the rest
 			// in order from where we started.
 			if pos = (pos + 1) % targetData.Len(); pos == startPos {
-				log.Error("[PROXY] [LOAD BALANCING] All hosts seem to be down, all uptime tests are failing!")
-				return host
+				return "", fmt.Errorf("all hosts are down, uptime tests are failing")
 			}
 		}
 
@@ -137,11 +139,16 @@ func GetNextTarget(targetData *apidef.HostList, spec *APISpec) string {
 
 	gotHost, err := targetData.GetIndex(0)
 	if err != nil {
-		log.Error("[PROXY] ", err)
-		return gotHost
+		return "", err
 	}
-	return EnsureTransport(gotHost)
+	return EnsureTransport(gotHost), nil
 }
+
+var (
+	onceStartAllHostsDown sync.Once
+
+	allHostsDownURL string
+)
 
 // TykNewSingleHostReverseProxy returns a new ReverseProxy that rewrites
 // URLs to the scheme, host, and base path provided in target. If the
@@ -150,13 +157,32 @@ func GetNextTarget(targetData *apidef.HostList, spec *APISpec) string {
 // stdlib version by also setting the host to the target, this allows
 // us to work with heroku and other such providers
 func TykNewSingleHostReverseProxy(target *url.URL, spec *APISpec) *ReverseProxy {
+	onceStartAllHostsDown.Do(func() {
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "all hosts are down", http.StatusServiceUnavailable)
+		}
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			panic(err)
+		}
+		server := &http.Server{
+			Handler:        http.HandlerFunc(handler),
+			ReadTimeout:    1 * time.Second,
+			WriteTimeout:   1 * time.Second,
+			MaxHeaderBytes: 1 << 20,
+		}
+		allHostsDownURL = "http://" + listener.Addr().String()
+		go func() {
+			panic(server.Serve(listener))
+		}()
+	})
 	if spec.Proxy.ServiceDiscovery.UseDiscoveryService {
 		log.Debug("[PROXY] Service discovery enabled")
 		if ServiceCache == nil {
 			log.Debug("[PROXY] Service cache initialising")
 			expiry := 120
-			if globalConf.ServiceDiscovery.DefaultCacheTimeout > 0 {
-				expiry = globalConf.ServiceDiscovery.DefaultCacheTimeout
+			if config.Global.ServiceDiscovery.DefaultCacheTimeout > 0 {
+				expiry = config.Global.ServiceDiscovery.DefaultCacheTimeout
 			}
 			ServiceCache = cache.New(time.Duration(expiry)*time.Second, 15*time.Second)
 		}
@@ -168,13 +194,18 @@ func TykNewSingleHostReverseProxy(target *url.URL, spec *APISpec) *ReverseProxy 
 		switch {
 		case spec.Proxy.ServiceDiscovery.UseDiscoveryService:
 			var err error
-			hostList, err = GetURLFromService(spec)
+			hostList, err = urlFromService(spec)
 			if err != nil {
 				log.Error("[PROXY] [SERVICE DISCOVERY] Failed target lookup: ", err)
 			}
 			fallthrough // implies load balancing, with replaced host list
 		case spec.Proxy.EnableLoadBalancing:
-			lbRemote, err := url.Parse(GetNextTarget(hostList, spec))
+			host, err := nextTarget(hostList, spec)
+			if err != nil {
+				log.Error("[PROXY] [LOAD BALANCING] ", err)
+				host = allHostsDownURL
+			}
+			lbRemote, err := url.Parse(host)
 			if err != nil {
 				log.Error("[PROXY] [LOAD BALANCING] Couldn't parse target URL:", err)
 			} else {
@@ -198,11 +229,13 @@ func TykNewSingleHostReverseProxy(target *url.URL, spec *APISpec) *ReverseProxy 
 		}
 
 		// No override, and no load balancing? Use the existing target
-		req.URL.Scheme = targetToUse.Scheme
-		req.URL.Host = targetToUse.Host
 
-		// TODO: figure out a better fix for this
-		if targetToUse.Path != req.URL.Path {
+		// if this is false, there was an url rewrite, thus we
+		// don't want to do anything to the path - req.URL is
+		// already final.
+		if targetToUse == target {
+			req.URL.Scheme = targetToUse.Scheme
+			req.URL.Host = targetToUse.Host
 			req.URL.Path = singleJoiningSlash(targetToUse.Path, req.URL.Path)
 		}
 		if !spec.Proxy.PreserveHostHeader {
@@ -214,17 +247,20 @@ func TykNewSingleHostReverseProxy(target *url.URL, spec *APISpec) *ReverseProxy 
 			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
 		}
 		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to default value
-			req.Header.Set("User-Agent", "")
+			// Set Tyk's own default user agent. Without
+			// this line, we would get the net/http default.
+			req.Header.Set("User-Agent", defaultUserAgent)
 		}
 	}
 
-	return &ReverseProxy{Director: director, TykAPISpec: spec, FlushInterval: time.Duration(globalConf.HttpServerOptions.FlushInterval) * time.Millisecond}
+	proxy := &ReverseProxy{
+		Director:      director,
+		TykAPISpec:    spec,
+		FlushInterval: time.Duration(config.Global.HttpServerOptions.FlushInterval) * time.Millisecond,
+	}
+	proxy.ErrorHandler.BaseMiddleware = BaseMiddleware{spec, proxy}
+	return proxy
 }
-
-// onExitFlushLoop is a callback set by tests to detect the state of the
-// flushLoop() goroutine.
-var onExitFlushLoop func()
 
 // ReverseProxy is an HTTP Handler that takes an incoming request and
 // sends it to another server, proxying the response back to the
@@ -254,66 +290,29 @@ type ReverseProxy struct {
 	ErrorHandler ErrorHandler
 }
 
-type TykTransporter struct {
-	http.Transport
-}
-
-func (t *TykTransporter) SetTimeout(timeOut int) {
-	//t.Dial.Timeout = time.Duration(timeOut) * time.Second
-	t.ResponseHeaderTimeout = time.Duration(timeOut) * time.Second
-}
-
-func getMaxIdleConns() int {
-	return globalConf.MaxIdleConnsPerHost
-}
-
-var TykDefaultTransport = &TykTransporter{http.Transport{
-	Proxy:               http.ProxyFromEnvironment,
-	MaxIdleConnsPerHost: getMaxIdleConns(),
-	Dial: (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).Dial,
-	TLSHandshakeTimeout: 10 * time.Second,
-	TLSClientConfig:     &tls.Config{},
-}}
-
-func cleanSlashes(a string) string {
-	endSlash := strings.HasSuffix(a, "//")
-	startSlash := strings.HasPrefix(a, "//")
-
-	if startSlash {
-		a = "/" + strings.TrimPrefix(a, "//")
+func defaultTransport() *http.Transport {
+	// allocate a new one every time for now, to avoid modifying a
+	// global variable for each request's needs (e.g. timeouts).
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: config.Global.MaxIdleConnsPerHost, // default is 100
+		TLSHandshakeTimeout: 10 * time.Second,
 	}
-
-	if endSlash {
-		a = strings.TrimSuffix(a, "//") + "/"
-	}
-
-	return a
 }
 
 func singleJoiningSlash(a, b string) string {
-	a = cleanSlashes(a)
-	b = cleanSlashes(b)
-
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
-
-	switch {
-	case aslash && bslash:
-		log.Debug(a + b)
-		return a + b[1:]
-	case !aslash && !bslash:
-		if len(b) > 0 {
-			log.Debug(a + b)
-			return a + "/" + b
-		}
-		log.Debug(a + b)
-		return a
+	a = strings.TrimRight(a, "/")
+	b = strings.TrimLeft(b, "/")
+	if len(b) > 0 {
+		return a + "/" + b
 	}
-	log.Debug(a + b)
-	return a + b
+	return a
 }
 
 func copyHeader(dst, src http.Header) {
@@ -322,6 +321,16 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func cloneHeader(h http.Header) http.Header {
+	h2 := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		h2[k] = vv2
+	}
+	return h2
 }
 
 // Hop-by-hop headers. These are removed when sent to the backend.
@@ -338,34 +347,8 @@ var hopHeaders = []string{
 	"Upgrade",
 }
 
-type requestCanceler interface {
-	CancelRequest(*http.Request)
-}
-
-type runOnFirstRead struct {
-	io.Reader // optional; nil means empty body
-
-	fn func() // Run before first Read, then set to nil
-}
-
-func (c *runOnFirstRead) Read(bs []byte) (int, error) {
-	if c.fn != nil {
-		c.fn()
-		c.fn = nil
-	}
-	if c.Reader == nil {
-		return 0, io.EOF
-	}
-	return c.Reader.Read(bs)
-}
-
-func (p *ReverseProxy) Init(spec *APISpec) error {
-	p.ErrorHandler = ErrorHandler{BaseMiddleware: &BaseMiddleware{spec, p}}
-	return nil
-}
-
 func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) *http.Response {
-	return p.WrappedServeHTTP(rw, req, RecordDetail(req))
+	return p.WrappedServeHTTP(rw, req, recordDetail(req))
 	// return nil
 }
 
@@ -375,18 +358,18 @@ func (p *ReverseProxy) ServeHTTPForCache(rw http.ResponseWriter, req *http.Reque
 
 func (p *ReverseProxy) CheckHardTimeoutEnforced(spec *APISpec, req *http.Request) (bool, int) {
 	if !spec.EnforcedTimeoutEnabled {
-		return false, 0
+		return false, config.Global.ProxyDefaultTimeout
 	}
 
-	_, versionPaths, _, _ := spec.GetVersionData(req)
-	found, meta := spec.CheckSpecMatchesStatus(req.URL.Path, req.Method, versionPaths, HardTimeout)
+	_, versionPaths, _, _ := spec.Version(req)
+	found, meta := spec.CheckSpecMatchesStatus(req, versionPaths, HardTimeout)
 	if found {
 		intMeta := meta.(*int)
 		log.Debug("HARD TIMEOUT ENFORCED: ", *intMeta)
 		return true, *intMeta
 	}
 
-	return false, 0
+	return false, config.Global.ProxyDefaultTimeout
 }
 
 func (p *ReverseProxy) CheckCircuitBreakerEnforced(spec *APISpec, req *http.Request) (bool, *ExtendedCircuitBreakerMeta) {
@@ -394,8 +377,8 @@ func (p *ReverseProxy) CheckCircuitBreakerEnforced(spec *APISpec, req *http.Requ
 		return false, nil
 	}
 
-	_, versionPaths, _, _ := spec.GetVersionData(req)
-	found, meta := spec.CheckSpecMatchesStatus(req.URL.Path, req.Method, versionPaths, CircuitBreaker)
+	_, versionPaths, _, _ := spec.Version(req)
+	found, meta := spec.CheckSpecMatchesStatus(req, versionPaths, CircuitBreaker)
 	if found {
 		exMeta := meta.(*ExtendedCircuitBreakerMeta)
 		log.Debug("CB Enforced for path: ", *exMeta)
@@ -405,9 +388,11 @@ func (p *ReverseProxy) CheckCircuitBreakerEnforced(spec *APISpec, req *http.Requ
 	return false, nil
 }
 
-func GetTransport(timeOut int, rw http.ResponseWriter, req *http.Request, p *ReverseProxy) http.RoundTripper {
-	transport := TykDefaultTransport
-	transport.TLSClientConfig.InsecureSkipVerify = globalConf.ProxySSLInsecureSkipVerify
+func httpTransport(timeOut int, rw http.ResponseWriter, req *http.Request, p *ReverseProxy) http.RoundTripper {
+	transport := defaultTransport() // modifies a newly created transport
+	if config.Global.ProxySSLInsecureSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
 
 	// Use the default unless we've modified the timout
 	if timeOut > 0 {
@@ -416,8 +401,7 @@ func GetTransport(timeOut int, rw http.ResponseWriter, req *http.Request, p *Rev
 			Timeout:   time.Duration(timeOut) * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext
-		transport.SetTimeout(timeOut)
-
+		transport.ResponseHeaderTimeout = time.Duration(timeOut) * time.Second
 	}
 
 	if IsWebsocket(req) {
@@ -431,7 +415,22 @@ func GetTransport(timeOut int, rw http.ResponseWriter, req *http.Request, p *Rev
 func (p *ReverseProxy) WrappedServeHTTP(rw http.ResponseWriter, req *http.Request, withCache bool) *http.Response {
 	// 1. Check if timeouts are set for this endpoint
 	_, timeout := p.CheckHardTimeoutEnforced(p.TykAPISpec, req)
-	transport := GetTransport(timeout, rw, req, p)
+	transport := httpTransport(timeout, rw, req, p)
+
+	ctx := req.Context()
+	if cn, ok := rw.(http.CloseNotifier); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		notifyChan := cn.CloseNotify()
+		go func() {
+			select {
+			case <-notifyChan:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	// Do this before we make a shallow copy
 	session := ctxGetSession(req)
@@ -448,49 +447,22 @@ func (p *ReverseProxy) WrappedServeHTTP(rw http.ResponseWriter, req *http.Reques
 	log.Debug("UPSTREAM REQUEST URL: ", req.URL)
 
 	// We need to double set the context for the outbound request to reprocess the target
-	if p.TykAPISpec.URLRewriteEnabled {
-		if req.Context().Value(RetainHost) == true {
-			log.Debug("Detected host rewrite, notifying director")
-			setCtxValue(outreq, RetainHost, true)
-		}
+	if p.TykAPISpec.URLRewriteEnabled && req.Context().Value(RetainHost) == true {
+		log.Debug("Detected host rewrite, notifying director")
+		setCtxValue(outreq, RetainHost, true)
 	}
 
-	if closeNotifier, ok := rw.(http.CloseNotifier); ok {
-		if requestCanceler, ok := transport.(requestCanceler); ok {
-			reqDone := make(chan struct{})
-			defer close(reqDone)
-
-			clientGone := closeNotifier.CloseNotify()
-
-			outreq.Body = struct {
-				io.Reader
-				io.Closer
-			}{
-				Reader: &runOnFirstRead{
-					Reader: outreq.Body,
-					fn: func() {
-						go func() {
-							select {
-							case <-clientGone:
-								requestCanceler.CancelRequest(outreq)
-							case <-reqDone:
-							}
-						}()
-					},
-				},
-				Closer: outreq.Body,
-			}
-		}
+	if req.ContentLength == 0 {
+		outreq.Body = nil // Issue 16036: nil Body for http.Transport retries
 	}
+	outreq = outreq.WithContext(ctx)
+
+	outreq.Header = cloneHeader(req.Header)
 
 	p.Director(outreq)
-
-	outreq.Proto = "HTTP/1.1"
-	outreq.ProtoMajor = 1
-	outreq.ProtoMinor = 1
 	outreq.Close = false
 
-	// Remove headers with the same name as the connection-tokens.
+	// Remove hop-by-hop headers listed in the "Connection" header.
 	// See RFC 2616, section 14.10.
 	if c := outreq.Header.Get("Connection"); c != "" {
 		for _, f := range strings.Split(c, ",") {
@@ -504,29 +476,18 @@ func (p *ReverseProxy) WrappedServeHTTP(rw http.ResponseWriter, req *http.Reques
 
 	// Do not modify outbound request headers if they are WS
 	if !IsWebsocket(outreq) {
-
-		// Remove hop-by-hop headers to the backend.  Especially
+		// Remove hop-by-hop headers to the backend. Especially
 		// important is "Connection" because we want a persistent
-		// connection, regardless of what the client sent to us.  This
-		// is modifying the same underlying map from req (shallow
-		// copied above) so we only copy it if necessary.
-		copiedHeaders := false
+		// connection, regardless of what the client sent to us.
 		for _, h := range hopHeaders {
 			if outreq.Header.Get(h) != "" {
-				if !copiedHeaders {
-					outreq.Header = make(http.Header)
-					logreq.Header = make(http.Header)
-					copyHeader(outreq.Header, req.Header)
-					copyHeader(logreq.Header, req.Header)
-					copiedHeaders = true
-				}
 				outreq.Header.Del(h)
 				logreq.Header.Del(h)
 			}
 		}
 	}
 
-	addrs := requestAddrs(req)
+	addrs := requestIPHops(req)
 	outreq.Header.Set("X-Forwarded-For", addrs)
 
 	// Circuit breaker
@@ -536,18 +497,15 @@ func (p *ReverseProxy) WrappedServeHTTP(rw http.ResponseWriter, req *http.Reques
 	var err error
 	if breakerEnforced {
 		log.Debug("ON REQUEST: Breaker status: ", breakerConf.CB.Ready())
-		if breakerConf.CB.Ready() {
-			res, err = transport.RoundTrip(outreq)
-			if err != nil {
-				breakerConf.CB.Fail()
-			} else if res.StatusCode == 500 {
-				breakerConf.CB.Fail()
-			} else {
-				breakerConf.CB.Success()
-			}
-		} else {
+		if !breakerConf.CB.Ready() {
 			p.ErrorHandler.HandleError(rw, logreq, "Service temporarily unnavailable.", 503)
 			return nil
+		}
+		res, err = transport.RoundTrip(outreq)
+		if err != nil || res.StatusCode == 500 {
+			breakerConf.CB.Fail()
+		} else {
+			breakerConf.CB.Success()
 		}
 	} else {
 		res, err = transport.RoundTrip(outreq)
@@ -625,22 +583,30 @@ func (p *ReverseProxy) WrappedServeHTTP(rw http.ResponseWriter, req *http.Reques
 		ses = session
 	}
 
-	if p.TykAPISpec.ResponseHandlersActive {
-		// Middleware chain handling here - very simple, but should do the trick
-		err := handleResponseChain(p.TykAPISpec.ResponseChain, rw, res, req, ses)
-		if err != nil {
-			log.Error("Response chain failed! ", err)
-		}
+	// Middleware chain handling here - very simple, but should do
+	// the trick. Chain can be empty, in which case this is a no-op.
+	if err := handleResponseChain(p.TykAPISpec.ResponseChain, rw, res, req, ses); err != nil {
+		log.Error("Response chain failed! ", err)
 	}
 
 	// We should at least copy the status code in
 	inres.StatusCode = res.StatusCode
 	inres.ContentLength = res.ContentLength
-	p.HandleResponse(rw, res, req, ses)
+	p.HandleResponse(rw, res, ses)
 	return inres
 }
 
-func (p *ReverseProxy) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *SessionState) error {
+func (p *ReverseProxy) HandleResponse(rw http.ResponseWriter, res *http.Response, ses *SessionState) error {
+
+	// Remove hop-by-hop headers listed in the
+	// "Connection" header of the response.
+	if c := res.Header.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				res.Header.Del(f)
+			}
+		}
+	}
 
 	for _, h := range hopHeaders {
 		res.Header.Del(h)
@@ -648,7 +614,7 @@ func (p *ReverseProxy) HandleResponse(rw http.ResponseWriter, res *http.Response
 	defer res.Body.Close()
 
 	// Close connections
-	if globalConf.CloseConnections {
+	if config.Global.CloseConnections {
 		res.Header.Set("Connection", "close")
 	}
 
@@ -681,7 +647,39 @@ func (p *ReverseProxy) CopyResponse(dst io.Writer, src io.Reader) {
 		}
 	}
 
-	io.Copy(dst, src)
+	p.copyBuffer(dst, src, nil)
+}
+
+func (p *ReverseProxy) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+	if len(buf) == 0 {
+		buf = make([]byte, 32*1024)
+	}
+	var written int64
+	for {
+		nr, rerr := src.Read(buf)
+		if rerr != nil && rerr != io.EOF && rerr != context.Canceled {
+			log.WithFields(logrus.Fields{
+				"prefix": "proxy",
+				"org_id": p.TykAPISpec.OrgID,
+				"api_id": p.TykAPISpec.APIID,
+			}).Error("http: proxy error during body copy: ", rerr)
+		}
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			return written, rerr
+		}
+	}
 }
 
 type writeFlusher interface {
@@ -709,9 +707,6 @@ func (m *maxLatencyWriter) flushLoop() {
 	for {
 		select {
 		case <-m.done:
-			if onExitFlushLoop != nil {
-				onExitFlushLoop()
-			}
 			return
 		case <-t.C:
 			m.mu.Lock()
@@ -722,3 +717,67 @@ func (m *maxLatencyWriter) flushLoop() {
 }
 
 func (m *maxLatencyWriter) stop() { m.done <- true }
+
+func requestIP(r *http.Request) string {
+	if real := r.Header.Get("X-Real-IP"); real != "" {
+		return real
+	}
+	if fw := r.Header.Get("X-Forwarded-For"); fw != "" {
+		// X-Forwarded-For has no port
+		if i := strings.IndexByte(fw, ','); i >= 0 {
+			return fw[:i]
+		}
+		return fw
+	}
+
+	// From net/http.Request.RemoteAddr:
+	//   The HTTP server in this package sets RemoteAddr to an
+	//   "IP:port" address before invoking a handler.
+	// So we can ignore the case of the port missing.
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+func requestIPHops(r *http.Request) string {
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	// If we aren't the first proxy retain prior
+	// X-Forwarded-For information as a comma+space
+	// separated list and fold multiple headers into one.
+	if prior, ok := r.Header["X-Forwarded-For"]; ok {
+		clientIP = strings.Join(prior, ", ") + ", " + clientIP
+	}
+	return clientIP
+}
+
+func copyRequest(r *http.Request) *http.Request {
+	r2 := *r
+	if r.Body != nil {
+		defer r.Body.Close()
+
+		var buf1, buf2 bytes.Buffer
+		io.Copy(&buf1, r.Body)
+		buf2 = buf1
+
+		r.Body = ioutil.NopCloser(&buf1)
+		r2.Body = ioutil.NopCloser(&buf2)
+	}
+	return &r2
+}
+
+func copyResponse(r *http.Response) *http.Response {
+	r2 := *r
+	if r.Body != nil {
+		defer r.Body.Close()
+
+		var buf1, buf2 bytes.Buffer
+		io.Copy(&buf1, r.Body)
+		buf2 = buf1
+
+		r.Body = ioutil.NopCloser(&buf1)
+		r2.Body = ioutil.NopCloser(&buf2)
+	}
+	return &r2
+}

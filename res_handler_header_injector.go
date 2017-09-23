@@ -21,7 +21,6 @@ type HeaderInjector struct {
 func (h *HeaderInjector) Init(c interface{}, spec *APISpec) error {
 	h.Spec = spec
 	if err := mapstructure.Decode(c, &h.config); err != nil {
-		log.Error(err)
 		return err
 	}
 	return nil
@@ -30,8 +29,8 @@ func (h *HeaderInjector) Init(c interface{}, spec *APISpec) error {
 func (h *HeaderInjector) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *SessionState) error {
 	// TODO: This should only target specific paths
 
-	_, versionPaths, _, _ := h.Spec.GetVersionData(req)
-	found, meta := h.Spec.CheckSpecMatchesStatus(req.URL.Path, req.Method, versionPaths, HeaderInjectedResponse)
+	_, versionPaths, _, _ := h.Spec.Version(req)
+	found, meta := h.Spec.CheckSpecMatchesStatus(req, versionPaths, HeaderInjectedResponse)
 	if found {
 		hmeta := meta.(*apidef.HeaderInjectionMeta)
 		for _, dKey := range hmeta.DeleteHeaders {

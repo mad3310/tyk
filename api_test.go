@@ -15,23 +15,19 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 )
 
 const apiTestDef = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"versions": {
-			"Default": {
-				"name": "Default"
-			}
+			"v1": {"name": "v1"}
 		}
 	},
 	"proxy": {
@@ -52,6 +48,9 @@ type testAPIDefinition struct {
 
 func TestHealthCheckEndpoint(t *testing.T) {
 	uri := "/tyk/health/?api_id=1"
+	old := config.Global.HealthCheck.EnableHealthChecks
+	config.Global.HealthCheck.EnableHealthChecks = true
+	defer func() { config.Global.HealthCheck.EnableHealthChecks = old }()
 
 	recorder := httptest.NewRecorder()
 	loadSampleAPI(t, apiTestDef)
@@ -78,7 +77,7 @@ func createSampleSession() *SessionState {
 			"1": {
 				APIName:  "Test",
 				APIID:    "1",
-				Versions: []string{"Default"},
+				Versions: []string{"v1"},
 			},
 		},
 	}
@@ -210,8 +209,8 @@ func TestApiHandlerPostDupPath(t *testing.T) {
 func TestApiHandlerPostDbConfig(t *testing.T) {
 	uri := "/tyk/apis/1"
 
-	globalConf.UseDBAppConfigs = true
-	defer func() { globalConf.UseDBAppConfigs = false }()
+	config.Global.UseDBAppConfigs = true
+	defer func() { config.Global.UseDBAppConfigs = false }()
 
 	recorder := httptest.NewRecorder()
 
@@ -314,24 +313,26 @@ func TestKeyHandlerUpdateKey(t *testing.T) {
 }
 
 func TestKeyHandlerGetKey(t *testing.T) {
-	for _, api_id := range []string{"1", "none", ""} {
-		loadSampleAPI(t, apiTestDef)
-		createKey(t)
+	for _, pathSuffix := range []string{"/", "/1234"} {
+		for _, api_id := range []string{"1", "none", ""} {
+			loadSampleAPI(t, apiTestDef)
+			createKey(t)
 
-		uri := "/tyk/keys/1234"
+			uri := "/tyk/keys" + pathSuffix
 
-		recorder := httptest.NewRecorder()
-		param := make(url.Values)
+			recorder := httptest.NewRecorder()
+			param := make(url.Values)
 
-		if api_id != "" {
-			param.Set("api_id", api_id)
-		}
-		req := withAuth(testReq(t, "GET", uri+"?"+param.Encode(), nil))
+			if api_id != "" {
+				param.Set("api_id", api_id)
+			}
+			req := withAuth(testReq(t, "GET", uri+"?"+param.Encode(), nil))
 
-		mainRouter.ServeHTTP(recorder, req)
+			mainRouter.ServeHTTP(recorder, req)
 
-		if recorder.Code != 200 {
-			t.Error("key not requested, status error:\n", recorder.Body.String())
+			if recorder.Code != 200 {
+				t.Error("key not requested, status error:\n", recorder.Body.String())
+			}
 		}
 	}
 }
@@ -415,7 +416,7 @@ func TestCreateKeyHandlerCreateNewKey(t *testing.T) {
 }
 
 func TestAPIAuthFail(t *testing.T) {
-	uri := "/tyk/health/?api_id=1"
+	uri := "/tyk/apis/"
 	loadSampleAPI(t, apiTestDef)
 
 	recorder := httptest.NewRecorder()
@@ -430,7 +431,7 @@ func TestAPIAuthFail(t *testing.T) {
 }
 
 func TestAPIAuthOk(t *testing.T) {
-	uri := "/tyk/health/?api_id=1"
+	uri := "/tyk/apis/"
 
 	recorder := httptest.NewRecorder()
 	req := withAuth(testReq(t, "GET", uri, nil))
@@ -440,6 +441,25 @@ func TestAPIAuthOk(t *testing.T) {
 
 	if recorder.Code != 200 {
 		t.Error("Access to API should have gone through, but response code was: ", recorder.Code)
+	}
+}
+
+func TestInvalidateCache(t *testing.T) {
+	for _, suffix := range []string{"", "/"} {
+		loadSampleAPI(t, apiTestDef)
+
+		// TODO: Note that this test is fairly dumb, as it doesn't check
+		// that the cache is empty and will pass even if the apiID does
+		// not exist. This test should be improved to check that the
+		// endpoint actually did what it's supposed to.
+		rec := httptest.NewRecorder()
+		req := withAuth(testReq(t, "DELETE", "/tyk/cache/1"+suffix, nil))
+
+		mainRouter.ServeHTTP(rec, req)
+
+		if rec.Code != 200 {
+			t.Errorf("Could not invalidate cache: %v\n%v", rec.Code, rec.Body)
+		}
 	}
 }
 
@@ -486,6 +506,31 @@ func TestResetHandler(t *testing.T) {
 	reloadTick <- time.Time{}
 	wg.Wait()
 
+	apisMu.RLock()
+	if len(apisByID) == 0 {
+		t.Fatal("Hot reload was triggered but no APIs were found.")
+	}
+	apisMu.RUnlock()
+}
+
+func TestResetHandlerBlock(t *testing.T) {
+	apisMu.Lock()
+	apisByID = make(map[string]*APISpec)
+	apisMu.Unlock()
+	loadSampleAPI(t, apiTestDef)
+
+	recorder := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/tyk/reload?block=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// have a tick ready for grabs
+	go func() { reloadTick <- time.Time{} }()
+	resetHandler(nil)(recorder, req)
+
+	if recorder.Code != 200 {
+		t.Fatal("Hot reload failed, response code was: ", recorder.Code)
+	}
 	apisMu.RLock()
 	if len(apisByID) == 0 {
 		t.Fatal("Hot reload was triggered but no APIs were found.")
@@ -557,10 +602,8 @@ func TestGroupResetHandler(t *testing.T) {
 func TestHotReloadSingle(t *testing.T) {
 	oldRouter := mainRouter
 	var wg sync.WaitGroup
-	if !reloadURLStructure(wg.Done) {
-		t.Fatal("reload wasn't queued")
-	}
 	wg.Add(1)
+	reloadURLStructure(wg.Done)
 	reloadTick <- time.Time{}
 	wg.Wait()
 	if mainRouter == oldRouter {
@@ -569,55 +612,41 @@ func TestHotReloadSingle(t *testing.T) {
 }
 
 func TestHotReloadMany(t *testing.T) {
-	done := 0
 	var wg sync.WaitGroup
+	wg.Add(25)
 	// Spike of 25 reloads all at once, not giving any time for the
 	// reload worker to pick up any of them. A single one is queued
 	// and waits.
+	// We get a callback for all of them, so 25 wg.Done calls.
 	for i := 0; i < 25; i++ {
-		if reloadURLStructure(wg.Done) {
-			wg.Add(1)
-			done++
-		}
-	}
-	if want := 1; done != want {
-		t.Fatalf("wanted actual reloads to be %d, was %d", want, done)
+		reloadURLStructure(wg.Done)
 	}
 	// pick it up and finish it
 	reloadTick <- time.Time{}
 	wg.Wait()
+
 	// 5 reloads, but this time slower - the reload worker has time
 	// to do all of them.
 	for i := 0; i < 5; i++ {
-		if reloadURLStructure(wg.Done) {
-			wg.Add(1)
-			done++
-		}
+		wg.Add(1)
+		reloadURLStructure(wg.Done)
 		// pick it up and finish it
 		reloadTick <- time.Time{}
 		wg.Wait()
-	}
-	if want := 6; done != want {
-		t.Fatalf("wanted actual reloads to be %d, was %d", want, done)
 	}
 }
 
 const apiBenchDef = `{
 	"api_id": "REPLACE",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
-			"Default": {
-				"name": "Default"
-			}
+			"v1": {"name": "v1"}
 		}
 	},
 	"proxy": {

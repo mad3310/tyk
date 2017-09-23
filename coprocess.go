@@ -3,19 +3,21 @@
 package main
 
 import (
+	"strings"
+
 	"github.com/Sirupsen/logrus"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/coprocess"
 
-	"bytes"
 	"errors"
 	"io/ioutil"
 	"net/http"
 )
 
 var (
-	// EnableCoProcess will be overridden by globalConf.EnableCoProcess.
+	// EnableCoProcess will be overridden by config.Global.EnableCoProcess.
 	EnableCoProcess = false
 
 	// GlobalDispatcher will be implemented by the current CoProcess driver.
@@ -24,18 +26,18 @@ var (
 
 // CoProcessMiddleware is the basic CP middleware struct.
 type CoProcessMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 	HookType         coprocess.HookType
 	HookName         string
 	MiddlewareDriver apidef.MiddlewareDriver
 }
 
-func (mw *CoProcessMiddleware) GetName() string {
+func (mw *CoProcessMiddleware) Name() string {
 	return "CoProcessMiddleware"
 }
 
 // CreateCoProcessMiddleware initializes a new CP middleware, takes hook type (pre, post, etc.), hook name ("my_hook") and driver ("python").
-func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid *BaseMiddleware) func(http.Handler) http.Handler {
+func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid BaseMiddleware) func(http.Handler) http.Handler {
 	dMiddleware := &CoProcessMiddleware{
 		BaseMiddleware:   baseMid,
 		HookType:         hookType,
@@ -43,7 +45,7 @@ func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwD
 		MiddlewareDriver: mwDriver,
 	}
 
-	return CreateMiddleware(dMiddleware, baseMid)
+	return createMiddleware(dMiddleware)
 }
 
 func doCoprocessReload() {
@@ -62,8 +64,8 @@ type CoProcessor struct {
 	Middleware *CoProcessMiddleware
 }
 
-// GetObjectFromRequest constructs a CoProcessObject from a given http.Request.
-func (c *CoProcessor) GetObjectFromRequest(r *http.Request) *coprocess.Object {
+// ObjectFromRequest constructs a CoProcessObject from a given http.Request.
+func (c *CoProcessor) ObjectFromRequest(r *http.Request) *coprocess.Object {
 	var body string
 	if r.Body == nil {
 		body = ""
@@ -75,17 +77,16 @@ func (c *CoProcessor) GetObjectFromRequest(r *http.Request) *coprocess.Object {
 
 	miniRequestObject := &coprocess.MiniRequestObject{
 		Headers:        ProtoMap(r.Header),
-		SetHeaders:     make(map[string]string),
-		DeleteHeaders:  make([]string, 0),
+		SetHeaders:     map[string]string{},
+		DeleteHeaders:  []string{},
 		Body:           body,
 		Url:            r.URL.Path,
 		Params:         ProtoMap(r.URL.Query()),
-		AddParams:      make(map[string]string),
+		AddParams:      map[string]string{},
 		ExtendedParams: ProtoMap(nil),
-		DeleteParams:   make([]string, 0),
+		DeleteParams:   []string{},
 		ReturnOverrides: &coprocess.ReturnOverrides{
-			ResponseCode:  -1,
-			ResponseError: "",
+			ResponseCode: -1,
 		},
 	}
 
@@ -126,7 +127,7 @@ func (c *CoProcessor) GetObjectFromRequest(r *http.Request) *coprocess.Object {
 // ObjectPostProcess does CoProcessObject post-processing (adding/removing headers or params, etc.).
 func (c *CoProcessor) ObjectPostProcess(object *coprocess.Object, r *http.Request) {
 	r.ContentLength = int64(len(object.Request.Body))
-	r.Body = ioutil.NopCloser(bytes.NewBufferString(object.Request.Body))
+	r.Body = ioutil.NopCloser(strings.NewReader(object.Request.Body))
 
 	for _, dh := range object.Request.DeleteHeaders {
 		r.Header.Del(dh)
@@ -145,23 +146,24 @@ func (c *CoProcessor) ObjectPostProcess(object *coprocess.Object, r *http.Reques
 		values.Set(p, v)
 	}
 
+	r.URL.Path = object.Request.Url
 	r.URL.RawQuery = values.Encode()
 }
 
 // CoProcessInit creates a new CoProcessDispatcher, it will be called when Tyk starts.
 func CoProcessInit() error {
 	var err error
-	if globalConf.CoProcessOptions.EnableCoProcess {
+	if config.Global.CoProcessOptions.EnableCoProcess {
 		GlobalDispatcher, err = NewCoProcessDispatcher()
 		EnableCoProcess = true
 	}
 	return err
 }
 
-// IsEnabledForSpec checks if this middleware should be enabled for a given API.
-func (m *CoProcessMiddleware) IsEnabledForSpec() bool {
+// EnabledForSpec checks if this middleware should be enabled for a given API.
+func (m *CoProcessMiddleware) EnabledForSpec() bool {
 	// This flag is true when Tyk has been compiled with CP support and when the configuration enables it.
-	enableCoProcess := globalConf.CoProcessOptions.EnableCoProcess && EnableCoProcess
+	enableCoProcess := config.Global.CoProcessOptions.EnableCoProcess && EnableCoProcess
 	// This flag indicates if the current spec specifies any CP custom middleware.
 	var usesCoProcessMiddleware bool
 
@@ -232,7 +234,7 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 		// HookType: coprocess.PreHook,
 	}
 
-	object := coProcessor.GetObjectFromRequest(r)
+	object := coProcessor.ObjectFromRequest(r)
 
 	returnObject, err := coProcessor.Dispatch(object)
 	if err != nil {
@@ -252,17 +254,22 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 			"key":    token,
 		}).Info("Attempted access with invalid key.")
 
 		// Fire Authfailed Event
-		AuthFailed(m.BaseMiddleware, r, token)
+		AuthFailed(m, r, token)
 
 		// Report in health check
-		ReportHealthCheckValue(m.Spec.Health, KeyFailure, "1")
+		reportHealthValue(m.Spec, KeyFailure, "1")
 
-		return errors.New("Key not authorised"), int(returnObject.Request.ReturnOverrides.ResponseCode)
+		errorMsg := "Key not authorised"
+		if returnObject.Request.ReturnOverrides.ResponseError != "" {
+			errorMsg = returnObject.Request.ReturnOverrides.ResponseError
+		}
+
+		return errors.New(errorMsg), int(returnObject.Request.ReturnOverrides.ResponseCode)
 	}
 
 	if returnObject.Request.ReturnOverrides.ResponseCode > 0 {

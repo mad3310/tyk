@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
@@ -19,6 +20,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 )
 
 // APIModifyKeySuccess represents when a Key modification was successful
@@ -142,7 +144,7 @@ func doAddOrUpdate(keyName string, newSession *SessionState, dontReset bool) err
 		}
 	} else {
 		// nothing defined, add key to ALL
-		if !globalConf.AllowMasterKeys {
+		if !config.Global.AllowMasterKeys {
 			log.Error("Master keys disallowed in configuration, key not added.")
 			return errors.New("Master keys not allowed")
 		}
@@ -209,7 +211,7 @@ func GetKeyDetail(key, apiID string) (SessionState, bool) {
 		sessionManager = spec.SessionManager
 	}
 
-	return sessionManager.GetSessionDetail(key)
+	return sessionManager.SessionDetail(key)
 }
 
 func handleAddOrUpdate(keyName string, r *http.Request) (interface{}, int) {
@@ -252,7 +254,7 @@ func handleAddOrUpdate(keyName string, r *http.Request) (interface{}, int) {
 		}
 
 	}
-	suppressReset := r.FormValue("suppress_reset") == "1"
+	suppressReset := r.URL.Query().Get("suppress_reset") == "1"
 	if err := doAddOrUpdate(keyName, &newSession, suppressReset); err != nil {
 		return apiError("Failed to create key, ensure security settings are correct."), 500
 	}
@@ -264,12 +266,9 @@ func handleAddOrUpdate(keyName string, r *http.Request) (interface{}, int) {
 		event = EventTokenCreated
 	}
 	FireSystemEvent(event, EventTokenMeta{
-		EventMetaDefault: EventMetaDefault{
-			Message:            "Key modified.",
-			OriginatingRequest: "",
-		},
-		Org: newSession.OrgID,
-		Key: keyName,
+		EventMetaDefault: EventMetaDefault{Message: "Key modified."},
+		Org:              newSession.OrgID,
+		Key:              keyName,
 	})
 
 	response := APIModifyKeySuccess{
@@ -287,7 +286,7 @@ func handleGetDetail(sessionKey, apiID string) (interface{}, int) {
 		sessionManager = spec.SessionManager
 	}
 
-	session, ok := sessionManager.GetSessionDetail(sessionKey)
+	session, ok := sessionManager.SessionDetail(sessionKey)
 	if !ok {
 		return apiError("Key not found"), 404
 	}
@@ -307,7 +306,7 @@ type APIAllKeys struct {
 }
 
 func handleGetAllKeys(filter, apiID string) (interface{}, int) {
-	if globalConf.HashKeys {
+	if config.Global.HashKeys {
 		return apiError("Configuration is secured, key listings not available in hashed configurations"), 400
 	}
 
@@ -316,11 +315,11 @@ func handleGetAllKeys(filter, apiID string) (interface{}, int) {
 		sessionManager = spec.SessionManager
 	}
 
-	sessions := sessionManager.GetSessions(filter)
+	sessions := sessionManager.Sessions(filter)
 
 	fixed_sessions := make([]string, 0)
 	for _, s := range sessions {
-		if !strings.Contains(s, QuotaKeyPrefix) && !strings.Contains(s, RateLimitKeyPrefix) {
+		if !strings.HasPrefix(s, QuotaKeyPrefix) && !strings.HasPrefix(s, RateLimitKeyPrefix) {
 			fixed_sessions = append(fixed_sessions, s)
 		}
 	}
@@ -367,12 +366,9 @@ func handleDeleteKey(keyName, apiID string) (interface{}, int) {
 	statusObj := APIModifyKeySuccess{keyName, "ok", "deleted"}
 
 	FireSystemEvent(EventTokenDeleted, EventTokenMeta{
-		EventMetaDefault: EventMetaDefault{
-			Message:            "Key deleted.",
-			OriginatingRequest: "",
-		},
-		Org: orgID,
-		Key: keyName,
+		EventMetaDefault: EventMetaDefault{Message: "Key deleted."},
+		Org:              orgID,
+		Key:              keyName,
 	})
 
 	log.WithFields(logrus.Fields{
@@ -408,7 +404,7 @@ func handleDeleteHashedKey(keyName, apiID string) (interface{}, int) {
 	}
 
 	// This is so we bypass the hash function
-	sessStore := sessionManager.GetStore()
+	sessStore := sessionManager.Store()
 
 	// TODO: This is pretty ugly
 	setKeyName := "apikey-" + keyName
@@ -425,38 +421,13 @@ func handleDeleteHashedKey(keyName, apiID string) (interface{}, int) {
 	return statusObj, 200
 }
 
-func handleURLReload(fn func()) (interface{}, int) {
-	reloadURLStructure(fn)
-
-	log.WithFields(logrus.Fields{
-		"prefix": "api"}).Info("Reload URL Structure - Scheduled")
-
-	return apiOk(""), 200
-}
-
-func signalGroupReload() (interface{}, int) {
-	notice := Notification{
-		Command: NoticeGroupReload,
-	}
-
-	// Signal to the group via redis
-	MainNotifier.Notify(notice)
-
-	log.WithFields(logrus.Fields{
-		"prefix": "api"}).Info("Reloaded URL Structure - Success")
-
-	return apiOk(""), 200
-}
-
 func handleGetAPIList() (interface{}, int) {
 	apisMu.RLock()
 	defer apisMu.RUnlock()
 	apiIDList := make([]*apidef.APIDefinition, len(apisByID))
-
 	c := 0
 	for _, apiSpec := range apisByID {
 		apiIDList[c] = apiSpec.APIDefinition
-		apiIDList[c].RawData = nil
 		c++
 	}
 	return apiIDList, 200
@@ -475,7 +446,7 @@ func handleGetAPI(apiID string) (interface{}, int) {
 }
 
 func handleAddOrUpdateApi(apiID string, r *http.Request) (interface{}, int) {
-	if globalConf.UseDBAppConfigs {
+	if config.Global.UseDBAppConfigs {
 		log.Error("Rejected new API Definition due to UseDBAppConfigs = true")
 		return apiError("Due to enabled use_db_app_configs, please use the Dashboard API"), 500
 	}
@@ -492,7 +463,7 @@ func handleAddOrUpdateApi(apiID string, r *http.Request) (interface{}, int) {
 	}
 
 	// Create a filename
-	defFilePath := filepath.Join(globalConf.AppPath, newDef.APIID+".json")
+	defFilePath := filepath.Join(config.Global.AppPath, newDef.APIID+".json")
 
 	// If it exists, delete it
 	if _, err := os.Stat(defFilePath); err == nil {
@@ -527,7 +498,7 @@ func handleAddOrUpdateApi(apiID string, r *http.Request) (interface{}, int) {
 
 func handleDeleteAPI(apiID string) (interface{}, int) {
 	// Generate a filename
-	defFilePath := filepath.Join(globalConf.AppPath, apiID+".json")
+	defFilePath := filepath.Join(config.Global.AppPath, apiID+".json")
 
 	// If it exists, delete it
 	if _, err := os.Stat(defFilePath); err != nil {
@@ -584,8 +555,8 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 
 func keyHandler(w http.ResponseWriter, r *http.Request) {
 	keyName := mux.Vars(r)["keyName"]
-	filter := r.FormValue("filter")
-	apiID := r.FormValue("api_id")
+	filter := r.URL.Query().Get("filter")
+	apiID := r.URL.Query().Get("api_id")
 	var obj interface{}
 	var code int
 
@@ -603,7 +574,7 @@ func keyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "DELETE":
-		hashed := r.FormValue("hashed")
+		hashed := r.URL.Query().Get("hashed")
 		// Remove a key
 		if hashed == "" {
 			obj, code = handleDeleteKey(keyName, apiID)
@@ -629,7 +600,7 @@ func policyUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyName := mux.Vars(r)["keyName"]
-	apiID := r.FormValue("api_id")
+	apiID := r.URL.Query().Get("api_id")
 	obj, code := handleUpdateHashedKey(keyName, apiID, policRecord.Policy)
 
 	doJSONWrite(w, code, obj)
@@ -642,7 +613,7 @@ func handleUpdateHashedKey(keyName, apiID, policyId string) (interface{}, int) {
 	}
 
 	// This is so we bypass the hash function
-	sessStore := sessionManager.GetStore()
+	sessStore := sessionManager.Store()
 
 	// TODO: This is pretty ugly
 	setKeyName := "apikey-" + keyName
@@ -711,7 +682,7 @@ func handleUpdateHashedKey(keyName, apiID, policyId string) (interface{}, int) {
 
 func orgHandler(w http.ResponseWriter, r *http.Request) {
 	keyName := mux.Vars(r)["keyName"]
-	filter := r.FormValue("filter")
+	filter := r.URL.Query().Get("filter")
 	var obj interface{}
 	var code int
 
@@ -750,7 +721,7 @@ func handleOrgAddOrUpdate(keyName string, r *http.Request) (interface{}, int) {
 
 	if spec == nil {
 		log.Warning("Couldn't find org session store in active API list")
-		if globalConf.SupressDefaultOrgStore {
+		if config.Global.SupressDefaultOrgStore {
 			return apiError("No such organisation found in Active API list"), 404
 		}
 		sessionManager = &DefaultOrgStore
@@ -758,10 +729,10 @@ func handleOrgAddOrUpdate(keyName string, r *http.Request) (interface{}, int) {
 		sessionManager = spec.OrgSessionManager
 	}
 
-	if r.FormValue("reset_quota") == "1" {
+	if r.URL.Query().Get("reset_quota") == "1" {
 		sessionManager.ResetQuota(keyName, newSession)
 		newSession.QuotaRenews = time.Now().Unix() + newSession.QuotaRenewalRate
-		rawKey := QuotaKeyPrefix + publicHash(keyName)
+		rawKey := QuotaKeyPrefix + hashKey(keyName)
 
 		// manage quotas separately
 		DefaultQuotaStore.RemoveSession(rawKey)
@@ -798,7 +769,7 @@ func handleGetOrgDetail(orgID string) (interface{}, int) {
 		return apiError("Org not found"), 404
 	}
 
-	session, ok := spec.OrgSessionManager.GetSessionDetail(orgID)
+	session, ok := spec.OrgSessionManager.SessionDetail(orgID)
 	if !ok {
 		log.WithFields(logrus.Fields{
 			"prefix": "api",
@@ -822,10 +793,10 @@ func handleGetAllOrgKeys(filter string) (interface{}, int) {
 		return apiError("ORG not found"), 404
 	}
 
-	sessions := spec.OrgSessionManager.GetSessions(filter)
+	sessions := spec.OrgSessionManager.Sessions(filter)
 	fixed_sessions := make([]string, 0)
 	for _, s := range sessions {
-		if !strings.Contains(s, QuotaKeyPrefix) && !strings.Contains(s, RateLimitKeyPrefix) {
+		if !strings.HasPrefix(s, QuotaKeyPrefix) && !strings.HasPrefix(s, RateLimitKeyPrefix) {
 			fixed_sessions = append(fixed_sessions, s)
 		}
 	}
@@ -863,14 +834,35 @@ func groupResetHandler(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 	}).Info("Group reload accepted.")
 
-	obj, code := signalGroupReload()
-	doJSONWrite(w, code, obj)
+	// Signal to the group via redis
+	MainNotifier.Notify(Notification{Command: NoticeGroupReload})
+
+	log.WithFields(logrus.Fields{
+		"prefix": "api",
+	}).Info("Reloaded URL Structure - Success")
+
+	doJSONWrite(w, 200, apiOk(""))
 }
 
+// resetHandler will try to queue a reload. If fn is nil and block=true
+// was in the URL parameters, it will block until the reload is done.
+// Otherwise, it won't block and fn will be called once the reload is
+// finished.
 func resetHandler(fn func()) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		obj, code := handleURLReload(fn)
-		doJSONWrite(w, code, obj)
+		var wg sync.WaitGroup
+		if fn == nil && r.URL.Query().Get("block") == "true" {
+			wg.Add(1)
+			fn = wg.Done
+		}
+		reloadURLStructure(fn)
+
+		log.WithFields(logrus.Fields{
+			"prefix": "api",
+		}).Info("Reload URL Structure - Scheduled")
+
+		wg.Wait()
+		doJSONWrite(w, 200, apiOk(""))
 	}
 }
 
@@ -922,7 +914,7 @@ func createKeyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if globalConf.AllowMasterKeys {
+		if config.Global.AllowMasterKeys {
 			// nothing defined, add key to ALL
 			log.WithFields(logrus.Fields{
 				"prefix":      "api",
@@ -930,7 +922,7 @@ func createKeyHandler(w http.ResponseWriter, r *http.Request) {
 				"org_id":      newSession.OrgID,
 				"api_id":      "--",
 				"user_id":     "system",
-				"user_ip":     requestAddrs(r),
+				"user_ip":     requestIPHops(r),
 				"path":        "--",
 				"server_name": "system",
 			}).Warning("No API Access Rights set on key session, adding key to all APIs.")
@@ -958,7 +950,7 @@ func createKeyHandler(w http.ResponseWriter, r *http.Request) {
 				"org_id":      newSession.OrgID,
 				"api_id":      "--",
 				"user_id":     "system",
-				"user_ip":     requestAddrs(r),
+				"user_ip":     requestIPHops(r),
 				"path":        "--",
 				"server_name": "system",
 			}).Error("Master keys disallowed in configuration, key not added.")
@@ -976,12 +968,9 @@ func createKeyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	FireSystemEvent(EventTokenCreated, EventTokenMeta{
-		EventMetaDefault: EventMetaDefault{
-			Message:            "Key generated.",
-			OriginatingRequest: "",
-		},
-		Org: newSession.OrgID,
-		Key: newKey,
+		EventMetaDefault: EventMetaDefault{Message: "Key generated."},
+		Org:              newSession.OrgID,
+		Key:              newKey,
 	})
 
 	log.WithFields(logrus.Fields{
@@ -991,7 +980,7 @@ func createKeyHandler(w http.ResponseWriter, r *http.Request) {
 		"api_id":      "--",
 		"org_id":      newSession.OrgID,
 		"user_id":     "system",
-		"user_ip":     requestAddrs(r),
+		"user_ip":     requestIPHops(r),
 		"path":        "--",
 		"server_name": "system",
 	}).Info("Generated new key: (", ObfuscateKeyString(newKey), ")")
@@ -1008,7 +997,7 @@ type NewClientRequest struct {
 	ClientSecret      string `json:"secret"`
 }
 
-func createOauthClientStorageID(clientID string) string {
+func oauthClientStorageID(clientID string) string {
 	return prefixClient + clientID
 }
 
@@ -1046,7 +1035,7 @@ func createOauthClient(w http.ResponseWriter, r *http.Request) {
 		PolicyID:          newOauthClient.PolicyID,
 	}
 
-	storageID := createOauthClientStorageID(newClient.GetId())
+	storageID := oauthClientStorageID(newClient.GetId())
 	log.WithFields(logrus.Fields{
 		"prefix": "api",
 	}).Debug("Created storage ID: ", storageID)
@@ -1073,7 +1062,7 @@ func createOauthClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reportableClientData := NewClientRequest{
+	clientData := NewClientRequest{
 		ClientID:          newClient.GetId(),
 		ClientSecret:      newClient.GetSecret(),
 		ClientRedirectURI: newClient.GetRedirectUri(),
@@ -1083,16 +1072,16 @@ func createOauthClient(w http.ResponseWriter, r *http.Request) {
 	log.WithFields(logrus.Fields{
 		"prefix":            "api",
 		"apiID":             newOauthClient.APIID,
-		"clientID":          reportableClientData.ClientID,
-		"clientRedirectURI": reportableClientData.ClientRedirectURI,
+		"clientID":          clientData.ClientID,
+		"clientRedirectURI": clientData.ClientRedirectURI,
 		"status":            "ok",
 	}).Info("Created OAuth client")
 
-	doJSONWrite(w, 200, reportableClientData)
+	doJSONWrite(w, 200, clientData)
 }
 
 func invalidateOauthRefresh(w http.ResponseWriter, r *http.Request) {
-	apiID := r.FormValue("api_id")
+	apiID := r.URL.Query().Get("api_id")
 	if apiID == "" {
 		doJSONWrite(w, 400, apiError("Missing parameter api_id"))
 		return
@@ -1183,7 +1172,7 @@ func oAuthClientHandler(w http.ResponseWriter, r *http.Request) {
 
 // Get client details
 func getOauthClientDetails(keyName, apiID string) (interface{}, int) {
-	storageID := createOauthClientStorageID(keyName)
+	storageID := oauthClientStorageID(keyName)
 	apiSpec := getApiSpec(apiID)
 	if apiSpec == nil {
 		log.WithFields(logrus.Fields{
@@ -1219,7 +1208,7 @@ func getOauthClientDetails(keyName, apiID string) (interface{}, int) {
 
 // Delete Client
 func handleDeleteOAuthClient(keyName, apiID string) (interface{}, int) {
-	storageID := createOauthClientStorageID(keyName)
+	storageID := oauthClientStorageID(keyName)
 
 	apiSpec := getApiSpec(apiID)
 	if apiSpec == nil {
@@ -1310,11 +1299,11 @@ func getOauthClients(apiID string) (interface{}, int) {
 }
 
 func healthCheckhandler(w http.ResponseWriter, r *http.Request) {
-	if !globalConf.HealthCheck.EnableHealthChecks {
+	if !config.Global.HealthCheck.EnableHealthChecks {
 		doJSONWrite(w, 400, apiError("Health checks are not enabled for this node"))
 		return
 	}
-	apiID := r.FormValue("api_id")
+	apiID := r.URL.Query().Get("api_id")
 	if apiID == "" {
 		doJSONWrite(w, 400, apiError("missing api_id parameter"))
 		return
@@ -1324,7 +1313,7 @@ func healthCheckhandler(w http.ResponseWriter, r *http.Request) {
 		doJSONWrite(w, 404, apiError("API ID not found"))
 		return
 	}
-	health, _ := apiSpec.Health.GetApiHealthValues()
+	health, _ := apiSpec.Health.ApiHealthValues()
 	doJSONWrite(w, 200, health)
 }
 
@@ -1350,13 +1339,16 @@ func UserRatesCheck() http.HandlerFunc {
 func invalidateCacheHandler(w http.ResponseWriter, r *http.Request) {
 	apiID := mux.Vars(r)["apiID"]
 
-	spec := getApiSpec(apiID)
-	var orgid string
-	if spec != nil {
-		orgid = spec.OrgID
-	}
+	keyPrefix := "cache-" + apiID
+	matchPattern := keyPrefix + "*"
+	store := &RedisClusterStorageManager{KeyPrefix: keyPrefix, IsCache: true}
 
-	if err := handleInvalidateAPICache(apiID); err != nil {
+	if ok := store.DeleteScanMatch(matchPattern); !ok {
+		err := errors.New("scan/delete failed")
+		var orgid string
+		if spec := getApiSpec(apiID); spec != nil {
+			orgid = spec.OrgID
+		}
 		log.WithFields(logrus.Fields{
 			"prefix":      "api",
 			"api_id":      apiID,
@@ -1364,7 +1356,7 @@ func invalidateCacheHandler(w http.ResponseWriter, r *http.Request) {
 			"err":         err,
 			"org_id":      orgid,
 			"user_id":     "system",
-			"user_ip":     requestAddrs(r),
+			"user_ip":     requestIPHops(r),
 			"path":        "--",
 			"server_name": "system",
 		}).Error("Failed to delete cache: ", err)
@@ -1374,17 +1366,6 @@ func invalidateCacheHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	doJSONWrite(w, 200, apiOk("cache invalidated"))
-}
-
-func handleInvalidateAPICache(apiID string) error {
-	keyPrefix := "cache-" + strings.Replace(apiID, "/", "", -1)
-	matchPattern := keyPrefix + "*"
-	store := getGlobalLocalCacheStorageHandler(keyPrefix, false)
-
-	if ok := store.DeleteScanMatch(matchPattern); !ok {
-		return errors.New("scan/delete failed")
-	}
-	return nil
 }
 
 // TODO: Don't modify http.Request values in-place. We must right now

@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	"github.com/Sirupsen/logrus"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 var sessionLimiter = SessionLimiter{}
@@ -13,21 +15,21 @@ var sessionMonitor = Monitor{}
 // RateLimitAndQuotaCheck will check the incomming request and key whether it is within it's quota and
 // within it's rate limit, it makes use of the SessionLimiter object to do this
 type RateLimitAndQuotaCheck struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (k *RateLimitAndQuotaCheck) GetName() string {
+func (k *RateLimitAndQuotaCheck) Name() string {
 	return "RateLimitAndQuotaCheck"
 }
 
-func (k *RateLimitAndQuotaCheck) IsEnabledForSpec() bool {
+func (k *RateLimitAndQuotaCheck) EnabledForSpec() bool {
 	return !k.Spec.DisableRateLimit || !k.Spec.DisableQuota
 }
 
 func (k *RateLimitAndQuotaCheck) handleRateLimitFailure(r *http.Request, token string) (error, int) {
 	log.WithFields(logrus.Fields{
 		"path":   r.URL.Path,
-		"origin": GetIPFromRequest(r),
+		"origin": requestIP(r),
 		"key":    token,
 	}).Info("Key rate limit exceeded.")
 
@@ -35,12 +37,12 @@ func (k *RateLimitAndQuotaCheck) handleRateLimitFailure(r *http.Request, token s
 	k.FireEvent(EventRateLimitExceeded, EventRateLimitExceededMeta{
 		EventMetaDefault: EventMetaDefault{Message: "Key Rate Limit Exceeded", OriginatingRequest: EncodeRequestToEvent(r)},
 		Path:             r.URL.Path,
-		Origin:           GetIPFromRequest(r),
+		Origin:           requestIP(r),
 		Key:              token,
 	})
 
 	// Report in health check
-	ReportHealthCheckValue(k.Spec.Health, Throttle, "-1")
+	reportHealthValue(k.Spec, Throttle, "-1")
 
 	return errors.New("Rate limit exceeded"), 429
 }
@@ -48,7 +50,7 @@ func (k *RateLimitAndQuotaCheck) handleRateLimitFailure(r *http.Request, token s
 func (k *RateLimitAndQuotaCheck) handleQuotaFailure(r *http.Request, token string) (error, int) {
 	log.WithFields(logrus.Fields{
 		"path":   r.URL.Path,
-		"origin": GetIPFromRequest(r),
+		"origin": requestIP(r),
 		"key":    token,
 	}).Info("Key quota limit exceeded.")
 
@@ -56,12 +58,12 @@ func (k *RateLimitAndQuotaCheck) handleQuotaFailure(r *http.Request, token strin
 	k.FireEvent(EventQuotaExceeded, EventQuotaExceededMeta{
 		EventMetaDefault: EventMetaDefault{Message: "Key Quota Limit Exceeded", OriginatingRequest: EncodeRequestToEvent(r)},
 		Path:             r.URL.Path,
-		Origin:           GetIPFromRequest(r),
+		Origin:           requestIP(r),
 		Key:              token,
 	})
 
 	// Report in health check
-	ReportHealthCheckValue(k.Spec.Health, QuotaViolation, "-1")
+	reportHealthValue(k.Spec, QuotaViolation, "-1")
 
 	return errors.New("Quota exceeded"), 403
 }
@@ -71,7 +73,7 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 	session := ctxGetSession(r)
 	token := ctxGetAuthToken(r)
 
-	storeRef := k.Spec.SessionManager.GetStore()
+	storeRef := k.Spec.SessionManager.Store()
 	reason := sessionLimiter.ForwardMessage(session,
 		token,
 		storeRef,
@@ -81,11 +83,7 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 	// If either are disabled, save the write roundtrip
 	if !k.Spec.DisableRateLimit || !k.Spec.DisableQuota {
 		// Ensure quota and rate data for this session are recorded
-		if globalConf.UseAsyncSessionWrite {
-			go k.Spec.SessionManager.UpdateSession(token, session, getLifetime(k.Spec, session))
-		} else {
-			k.Spec.SessionManager.UpdateSession(token, session, getLifetime(k.Spec, session))
-		}
+		k.Spec.SessionManager.UpdateSession(token, session, getLifetime(k.Spec, session))
 		ctxSetSession(r, session)
 	}
 
@@ -102,7 +100,7 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 		return errors.New("Access denied"), 403
 	}
 	// Run the trigger monitor
-	if globalConf.Monitor.MonitorUserKeys {
+	if config.Global.Monitor.MonitorUserKeys {
 		sessionMonitor.Check(session, token)
 	}
 

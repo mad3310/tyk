@@ -13,6 +13,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/justinas/alice"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 const (
@@ -36,9 +38,7 @@ const keyRules = `{
 const oauthDefinition = `{
 	"api_id": "999999",
 	"org_id": "default",
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"use_oauth2": true,
 	"oauth_meta": {
 		"allowed_access_types": [
@@ -59,9 +59,7 @@ const oauthDefinition = `{
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
-			"Default": {
-				"name": "Default"
-			}
+			"v1": {"name": "v1"}
 		}
 	},
 	"proxy": {
@@ -88,12 +86,12 @@ func getOAuthChain(spec *APISpec, muxer *mux.Router) {
 
 	var redirectURI string
 	// If separator is not set that means multiple redirect uris not supported
-	if globalConf.OauthRedirectUriSeparator == "" {
+	if config.Global.OauthRedirectUriSeparator == "" {
 		redirectURI = "http://client.oauth.com"
 
 		// If separator config is set that means multiple redirect uris are supported
 	} else {
-		redirectURI = strings.Join([]string{"http://client.oauth.com", "http://client2.oauth.com", "http://client3.oauth.com"}, globalConf.OauthRedirectUriSeparator)
+		redirectURI = strings.Join([]string{"http://client.oauth.com", "http://client2.oauth.com", "http://client3.oauth.com"}, config.Global.OauthRedirectUriSeparator)
 	}
 	testClient := OAuthClient{
 		ClientID:          "1234",
@@ -106,14 +104,14 @@ func getOAuthChain(spec *APISpec, muxer *mux.Router) {
 	remote, _ := url.Parse(testHttpAny)
 	proxy := TykNewSingleHostReverseProxy(remote, spec)
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := &BaseMiddleware{spec, proxy}
-	chain := alice.New(
-		CreateMiddleware(&VersionCheck{BaseMiddleware: baseMid}, baseMid),
-		CreateMiddleware(&Oauth2KeyExists{baseMid}, baseMid),
-		CreateMiddleware(&KeyExpired{baseMid}, baseMid),
-		CreateMiddleware(&AccessRightsCheck{baseMid}, baseMid),
-		CreateMiddleware(&RateLimitAndQuotaCheck{baseMid}, baseMid)).Then(proxyHandler)
-
+	baseMid := BaseMiddleware{spec, proxy}
+	chain := alice.New(mwList(
+		&VersionCheck{BaseMiddleware: baseMid},
+		&Oauth2KeyExists{baseMid},
+		&KeyExpired{baseMid},
+		&AccessRightsCheck{baseMid},
+		&RateLimitAndQuotaCheck{baseMid},
+	)...).Then(proxyHandler)
 	muxer.Handle(spec.Proxy.ListenPath, chain)
 }
 
@@ -143,7 +141,7 @@ func TestAuthCodeRedirect(t *testing.T) {
 
 func TestAuthCodeRedirectMultipleURL(t *testing.T) {
 	// Enable multiple Redirect URIs
-	globalConf.OauthRedirectUriSeparator = ","
+	config.Global.OauthRedirectUriSeparator = ","
 
 	spec := createSpecTest(t, oauthDefinition)
 	testMuxer := mux.NewRouter()
@@ -170,7 +168,7 @@ func TestAuthCodeRedirectMultipleURL(t *testing.T) {
 
 func TestAuthCodeRedirectInvalidMultipleURL(t *testing.T) {
 	// Disable multiple Redirect URIs
-	globalConf.OauthRedirectUriSeparator = ""
+	config.Global.OauthRedirectUriSeparator = ""
 
 	spec := createSpecTest(t, oauthDefinition)
 	testMuxer := mux.NewRouter()
@@ -279,7 +277,7 @@ func TestAPIClientAuthorizeTokenWithPolicy(t *testing.T) {
 	}
 
 	// Verify the token is correct
-	session, ok := spec.AuthManager.IsKeyAuthorised(token)
+	session, ok := spec.AuthManager.KeyAuthorised(token)
 	if !ok {
 		t.Error("Key was not created (Can't find it)!")
 	}

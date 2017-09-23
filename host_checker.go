@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jeffail/tunny"
-	"github.com/pmylund/go-cache"
+	cache "github.com/pmylund/go-cache"
 )
 
 const (
@@ -76,14 +76,15 @@ func (h *HostUptimeChecker) getStaggeredTime() time.Duration {
 
 func (h *HostUptimeChecker) HostCheckLoop() {
 	for !h.stopLoop {
+		if runningTests {
+			<-hostCheckTicker
+		}
 		h.resetListMu.Lock()
-		if h.doResetList {
-			if h.newList != nil {
-				h.HostList = h.newList
-				h.newList = nil
-				h.doResetList = false
-				log.Debug("[HOST CHECKER] Host list reset")
-			}
+		if h.doResetList && h.newList != nil {
+			h.HostList = h.newList
+			h.newList = nil
+			h.doResetList = false
+			log.Debug("[HOST CHECKER] Host list reset")
 		}
 		h.resetListMu.Unlock()
 		for _, host := range h.HostList {
@@ -93,9 +94,7 @@ func (h *HostUptimeChecker) HostCheckLoop() {
 			}
 		}
 
-		if runningTests {
-			<-hostCheckTicker
-		} else {
+		if !runningTests {
 			time.Sleep(h.getStaggeredTime())
 		}
 	}
@@ -149,8 +148,7 @@ func (h *HostUptimeChecker) CheckHost(toCheck HostData) {
 		useMethod = "GET"
 	}
 
-	body := []byte(toCheck.Body)
-	req, err := http.NewRequest(useMethod, toCheck.CheckURL, bytes.NewBuffer(body))
+	req, err := http.NewRequest(useMethod, toCheck.CheckURL, strings.NewReader(toCheck.Body))
 	if err != nil {
 		log.Error("Could not create request: ", err)
 		return
@@ -247,11 +245,6 @@ func (h *HostUptimeChecker) Stop() {
 	h.stopPollingChan <- true
 	log.Info("[HOST CHECKER] Stopping poller")
 	h.pool.Close()
-}
-
-func (h *HostUptimeChecker) RemoveHost(name string) {
-	delete(h.HostList, name)
-	log.Info("[HOST CHECKER] Stopped tracking: ", name)
 }
 
 func (h *HostUptimeChecker) ResetList(hostList map[string]HostData) {

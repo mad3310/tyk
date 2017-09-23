@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -9,18 +11,17 @@ import (
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/lonelycode/gorpc"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 const sampleDefiniton = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"versions": {
 			"v1": {
@@ -42,14 +43,11 @@ const sampleDefiniton = `{
 
 const nonExpiringDef = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"versions": {
 			"v1": {
@@ -71,14 +69,11 @@ const nonExpiringDef = `{
 
 const nonExpiringMultiDef = `{
 	"api_id": "1",
-	"org_id": "default",
 	"definition": {
 		"location": "header",
 		"key": "version"
 	},
-	"auth": {
-		"auth_header_name": "authorization"
-	},
+	"auth": {"auth_header_name": "authorization"},
 	"version_data": {
 		"versions": {
 			"v1": {
@@ -108,8 +103,7 @@ const nonExpiringMultiDef = `{
 
 func createDefinitionFromString(defStr string) *APISpec {
 	loader := APIDefinitionLoader{}
-	def, rawDef := loader.ParseDefinition([]byte(defStr))
-	def.RawData = rawDef
+	def := loader.ParseDefinition([]byte(defStr))
 	spec := loader.MakeSpec(def)
 	spec.APIDefinition = def
 	return spec
@@ -121,7 +115,7 @@ func TestExpiredRequest(t *testing.T) {
 
 	spec := createDefinitionFromString(sampleDefiniton)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as expiry date is in the past!")
 	}
@@ -140,7 +134,7 @@ func TestNotVersioned(t *testing.T) {
 
 	//	writeDefToFile(spec.APIDefinition)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if !ok {
 		t.Error("Request should pass as versioning not in play!")
 	}
@@ -156,7 +150,7 @@ func TestMissingVersion(t *testing.T) {
 
 	spec := createDefinitionFromString(sampleDefiniton)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as there is no version number!")
 	}
@@ -173,7 +167,7 @@ func TestWrongVersion(t *testing.T) {
 
 	spec := createDefinitionFromString(sampleDefiniton)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as version number is wrong!")
 	}
@@ -190,7 +184,7 @@ func TestBlacklistLinks(t *testing.T) {
 
 	spec := createDefinitionFromString(nonExpiringDef)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as URL is blacklisted!")
 	}
@@ -203,7 +197,7 @@ func TestBlacklistLinks(t *testing.T) {
 	req = testReq(t, "GET", "/v1/disallowed/blacklist/abacab12345", nil)
 	req.Header.Set("version", "v1")
 
-	ok, status, _ = spec.IsRequestValid(req)
+	ok, status, _ = spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as URL (with dynamic ID) is blacklisted!")
 	}
@@ -220,7 +214,7 @@ func TestWhiteLIstLinks(t *testing.T) {
 
 	spec := createDefinitionFromString(nonExpiringDef)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if !ok {
 		t.Error("Request should be OK as URL is whitelisted!")
 	}
@@ -233,7 +227,7 @@ func TestWhiteLIstLinks(t *testing.T) {
 	req = testReq(t, "GET", "/v1/allowed/whitelist/12345abans", nil)
 	req.Header.Set("version", "v1")
 
-	ok, status, _ = spec.IsRequestValid(req)
+	ok, status, _ = spec.RequestValid(req)
 	if !ok {
 		t.Error("Request should be OK as URL is whitelisted (regex)!")
 	}
@@ -250,7 +244,7 @@ func TestWhiteListBlock(t *testing.T) {
 
 	spec := createDefinitionFromString(nonExpiringDef)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as things not in whitelist should be rejected!")
 	}
@@ -267,7 +261,7 @@ func TestIgnored(t *testing.T) {
 
 	spec := createDefinitionFromString(nonExpiringDef)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if !ok {
 		t.Error("Request should pass, URL is ignored")
 	}
@@ -284,7 +278,7 @@ func TestBlacklistLinksMulti(t *testing.T) {
 
 	spec := createDefinitionFromString(nonExpiringMultiDef)
 
-	ok, status, _ := spec.IsRequestValid(req)
+	ok, status, _ := spec.RequestValid(req)
 	if ok {
 		t.Error("Request should fail as URL is blacklisted!")
 	}
@@ -297,7 +291,7 @@ func TestBlacklistLinksMulti(t *testing.T) {
 	req = testReq(t, "GET", "/v1/disallowed/blacklist/abacab12345", nil)
 	req.Header.Set("version", "v2")
 
-	ok, status, _ = spec.IsRequestValid(req)
+	ok, status, _ = spec.RequestValid(req)
 	if !ok {
 		t.Error("Request should be OK as in v2 this URL is not blacklisted")
 		t.Error(spec.RxPaths["v2"])
@@ -310,28 +304,28 @@ func TestBlacklistLinksMulti(t *testing.T) {
 }
 
 func startRPCMock(dispatcher *gorpc.Dispatcher) *gorpc.Server {
-	globalConf.SlaveOptions.UseRPC = true
-	globalConf.SlaveOptions.RPCKey = "test_org"
-	globalConf.SlaveOptions.APIKey = "test"
+	config.Global.SlaveOptions.UseRPC = true
+	config.Global.SlaveOptions.RPCKey = "test_org"
+	config.Global.SlaveOptions.APIKey = "test"
 
-	server := gorpc.NewTCPServer(":9090", dispatcher.NewHandlerFunc())
-	go server.Serve()
-	globalConf.SlaveOptions.ConnectionString = server.Addr
+	server := gorpc.NewTCPServer("127.0.0.1:0", dispatcher.NewHandlerFunc())
+	list := &customListener{}
+	server.Listener = list
+	server.LogError = gorpc.NilErrorLogger
 
-	RPCCLientSingleton = gorpc.NewTCPClient(server.Addr)
-	RPCCLientSingleton.Conns = 1
-	RPCCLientSingleton.Start()
-	RPCClientIsConnected = true
-	RPCFuncClientSingleton = getDispatcher().NewFuncClient(RPCCLientSingleton)
+	if err := server.Start(); err != nil {
+		panic(err)
+	}
+	config.Global.SlaveOptions.ConnectionString = list.L.Addr().String()
 
 	return server
 }
 
 func stopRPCMock(server *gorpc.Server) {
-	globalConf.SlaveOptions.ConnectionString = ""
-	globalConf.SlaveOptions.RPCKey = ""
-	globalConf.SlaveOptions.APIKey = ""
-	globalConf.SlaveOptions.UseRPC = false
+	config.Global.SlaveOptions.ConnectionString = ""
+	config.Global.SlaveOptions.RPCKey = ""
+	config.Global.SlaveOptions.APIKey = ""
+	config.Global.SlaveOptions.UseRPC = false
 
 	server.Listener.Close()
 	server.Stop()
@@ -395,14 +389,14 @@ func TestGetAPISpecsDashboardSuccess(t *testing.T) {
 	apisByID = make(map[string]*APISpec)
 	apisMu.Unlock()
 
-	globalConf.UseDBAppConfigs = true
-	globalConf.AllowInsecureConfigs = true
-	globalConf.DBAppConfOptions.ConnectionString = ts.URL
+	config.Global.UseDBAppConfigs = true
+	config.Global.AllowInsecureConfigs = true
+	config.Global.DBAppConfOptions.ConnectionString = ts.URL
 
 	defer func() {
-		globalConf.UseDBAppConfigs = false
-		globalConf.AllowInsecureConfigs = false
-		globalConf.DBAppConfOptions.ConnectionString = ""
+		config.Global.UseDBAppConfigs = false
+		config.Global.AllowInsecureConfigs = false
+		config.Global.DBAppConfOptions.ConnectionString = ""
 	}()
 
 	var wg sync.WaitGroup
@@ -414,9 +408,6 @@ func TestGetAPISpecsDashboardSuccess(t *testing.T) {
 		}
 	}
 	handleRedisEvent(msg, handled, wg.Done)
-	if len(reloadChan) != 1 {
-		t.Fatal("Should trigger reload")
-	}
 
 	// Since we already know that reload is queued
 	reloadTick <- time.Time{}
@@ -432,11 +423,66 @@ func TestGetAPISpecsDashboardSuccess(t *testing.T) {
 
 func TestRoundRobin(t *testing.T) {
 	rr := RoundRobin{}
-	rr.SetMax(2)
-
 	for _, want := range []int{0, 1, 2, 0} {
-		if got := rr.GetPos(); got != want {
+		if got := rr.WithLen(3); got != want {
 			t.Errorf("RR Pos wrong: want %d got %d", want, got)
 		}
 	}
+	if got, want := rr.WithLen(0), 0; got != want {
+		t.Errorf("RR Pos of 0 wrong: want %d got %d", want, got)
+	}
+}
+
+func setupKeepalive(conn net.Conn) error {
+	tcpConn := conn.(*net.TCPConn)
+	if err := tcpConn.SetKeepAlive(true); err != nil {
+		return err
+	}
+	if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		return err
+	}
+	return nil
+}
+
+type customListener struct {
+	L net.Listener
+}
+
+func (ln *customListener) Init(addr string) (err error) {
+	ln.L, err = net.Listen("tcp", addr)
+	return
+}
+
+func (ln *customListener) Accept() (conn io.ReadWriteCloser, clientAddr string, err error) {
+	c, err := ln.L.Accept()
+	if err != nil {
+		return
+	}
+
+	if err = setupKeepalive(c); err != nil {
+		c.Close()
+		return
+	}
+
+	handshake := make([]byte, 6)
+	if _, err = io.ReadFull(c, handshake); err != nil {
+		return
+	}
+
+	idLenBuf := make([]byte, 1)
+	if _, err = io.ReadFull(c, idLenBuf); err != nil {
+		return
+	}
+
+	idLen := uint8(idLenBuf[0])
+	id := make([]byte, idLen)
+	if _, err = io.ReadFull(c, id); err != nil {
+		return
+	}
+
+	return c, string(id), nil
+}
+
+func (ln *customListener) Close() error {
+	return ln.L.Close()
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"regexp"
@@ -14,6 +15,8 @@ import (
 )
 
 var log = logger.Get()
+
+var Global Config
 
 type PoliciesConfig struct {
 	PolicySource           string `json:"policy_source"`
@@ -89,6 +92,8 @@ type WebHookHandlerConf struct {
 
 type SlaveOptionsConfig struct {
 	UseRPC                          bool   `json:"use_rpc"`
+	UseSSL                          bool   `json:"use_ssl"`
+	SSLInsecureSkipVerify           bool   `json:"ssl_insecure_skip_verify"`
 	ConnectionString                string `json:"connection_string"`
 	RPCKey                          string `json:"rpc_key"`
 	APIKey                          string `json:"api_key"`
@@ -236,6 +241,7 @@ type Config struct {
 	MaxIdleConnsPerHost               int                                   `bson:"max_idle_connections_per_host" json:"max_idle_connections_per_host"`
 	ReloadWaitTime                    int                                   `bson:"reload_wait_time" json:"reload_wait_time"`
 	ProxySSLInsecureSkipVerify        bool                                  `json:"proxy_ssl_insecure_skip_verify"`
+	ProxyDefaultTimeout               int                                   `json:"proxy_default_timeout"`
 }
 
 type CertData struct {
@@ -275,10 +281,6 @@ func WriteDefault(path string, conf *Config) {
 			MaxIdle: 100,
 			Port:    6379,
 		},
-		HealthCheck: HealthCheckConfig{
-			EnableHealthChecks:      true,
-			HealthCheckValueTimeout: 60,
-		},
 		AnalyticsConfig: AnalyticsConfigConfig{
 			IgnoredIPs: make([]string, 0),
 		},
@@ -306,11 +308,11 @@ func WriteDefault(path string, conf *Config) {
 // An error will be returned only if any of the paths existed but was
 // not a valid config file.
 func Load(paths []string, conf *Config) error {
-	var bs []byte
+	var r io.Reader
 	for _, path := range paths {
-		var err error
-		bs, err = ioutil.ReadFile(path)
+		f, err := os.Open(path)
 		if err == nil {
+			r = f
 			conf.OriginalPath = path
 			break
 		}
@@ -319,14 +321,14 @@ func Load(paths []string, conf *Config) error {
 		}
 		return err
 	}
-	if bs == nil {
+	if r == nil {
 		path := paths[0]
 		log.Warnf("No config file found, writing default to %s", path)
 		WriteDefault(path, conf)
 		log.Info("Loading default configuration...")
 		return Load([]string{path}, conf)
 	}
-	if err := json.Unmarshal(bs, &conf); err != nil {
+	if err := json.NewDecoder(r).Decode(&conf); err != nil {
 		return fmt.Errorf("couldn't unmarshal config: %v", err)
 	}
 

@@ -9,10 +9,10 @@ import (
 
 // KeyExpired middleware will check if the requesting key is expired or not. It makes use of the authManager to do so.
 type KeyExpired struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (k *KeyExpired) GetName() string {
+func (k *KeyExpired) Name() string {
 	return "KeyExpired"
 }
 
@@ -27,7 +27,7 @@ func (k *KeyExpired) ProcessRequest(w http.ResponseWriter, r *http.Request, _ in
 	if session.IsInactive {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
+			"origin": requestIP(r),
 			"key":    token,
 		}).Info("Attempted access from inactive key.")
 
@@ -35,38 +35,27 @@ func (k *KeyExpired) ProcessRequest(w http.ResponseWriter, r *http.Request, _ in
 		k.FireEvent(EventKeyExpired, EventKeyExpiredMeta{
 			EventMetaDefault: EventMetaDefault{Message: "Attempted access from inactive key.", OriginatingRequest: EncodeRequestToEvent(r)},
 			Path:             r.URL.Path,
-			Origin:           GetIPFromRequest(r),
+			Origin:           requestIP(r),
 			Key:              token,
 		})
 
 		// Report in health check
-		ReportHealthCheckValue(k.Spec.Health, KeyFailure, "-1")
+		reportHealthValue(k.Spec, KeyFailure, "-1")
 
 		return errors.New("Key is inactive, please renew"), 403
 	}
 
-	keyExpired := k.Spec.AuthManager.IsKeyExpired(session)
-
-	if keyExpired {
-		log.WithFields(logrus.Fields{
-			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
-			"key":    token,
-		}).Info("Attempted access from expired key.")
-
-		// Fire a key expired event
-		k.FireEvent(EventKeyExpired, EventKeyExpiredMeta{
-			EventMetaDefault: EventMetaDefault{Message: "Attempted access from expired key."},
-			Path:             r.URL.Path,
-			Origin:           GetIPFromRequest(r),
-			Key:              token,
-		})
-
-		// Report in health check
-		ReportHealthCheckValue(k.Spec.Health, KeyFailure, "-1")
-
-		return errors.New("Key has expired, please renew"), 401
+	if !k.Spec.AuthManager.KeyExpired(session) {
+		return nil, 200
 	}
+	log.WithFields(logrus.Fields{
+		"path":   r.URL.Path,
+		"origin": requestIP(r),
+		"key":    token,
+	}).Info("Attempted access from expired key.")
 
-	return nil, 200
+	// Report in health check
+	reportHealthValue(k.Spec, KeyFailure, "-1")
+
+	return errors.New("Key has expired, please renew"), 401
 }

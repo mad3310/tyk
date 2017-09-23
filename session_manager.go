@@ -5,6 +5,7 @@ import (
 
 	"github.com/TykTechnologies/leakybucket"
 	"github.com/TykTechnologies/leakybucket/memorycache"
+	"github.com/TykTechnologies/tyk/config"
 )
 
 type PublicSessionState struct {
@@ -26,13 +27,15 @@ const (
 
 // SessionLimiter is the rate limiter for the API, use ForwardMessage() to
 // check if a message should pass through or not
-type SessionLimiter struct{}
+type SessionLimiter struct {
+	bucketStore leakybucket.Storage
+}
 
-func (SessionLimiter) doRollingWindowWrite(key, rateLimiterKey, rateLimiterSentinelKey string, currentSession *SessionState, store StorageHandler) bool {
+func (l *SessionLimiter) doRollingWindowWrite(key, rateLimiterKey, rateLimiterSentinelKey string, currentSession *SessionState, store StorageHandler) bool {
 	log.Debug("[RATELIMIT] Inbound raw key is: ", key)
 	log.Debug("[RATELIMIT] Rate limiter key is: ", rateLimiterKey)
 	var ratePerPeriodNow int
-	if globalConf.EnableNonTransactionalRateLimiter {
+	if config.Global.EnableNonTransactionalRateLimiter {
 		ratePerPeriodNow, _ = store.SetRollingWindowPipeline(rateLimiterKey, int64(currentSession.Per), "-1")
 	} else {
 		ratePerPeriodNow, _ = store.SetRollingWindow(rateLimiterKey, int64(currentSession.Per), "-1")
@@ -42,7 +45,7 @@ func (SessionLimiter) doRollingWindowWrite(key, rateLimiterKey, rateLimiterSenti
 
 	// Subtract by 1 because of the delayed add in the window
 	subtractor := 1
-	if globalConf.EnableSentinelRateLImiter {
+	if config.Global.EnableSentinelRateLImiter {
 		// and another subtraction because of the preemptive limit
 		subtractor = 2
 	}
@@ -51,7 +54,7 @@ func (SessionLimiter) doRollingWindowWrite(key, rateLimiterKey, rateLimiterSenti
 
 	if ratePerPeriodNow > int(currentSession.Rate)-subtractor {
 		// Set a sentinel value with expire
-		if globalConf.EnableSentinelRateLImiter {
+		if config.Global.EnableSentinelRateLImiter {
 			store.SetRawKey(rateLimiterSentinelKey, "1", int64(currentSession.Per))
 		}
 		return true
@@ -72,12 +75,12 @@ const (
 // sessionFailReason if session limits have been exceeded.
 // Key values to manage rate are Rate and Per, e.g. Rate of 10 messages
 // Per 10 seconds
-func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string, store StorageHandler, enableRL, enableQ bool) sessionFailReason {
-	rateLimiterKey := RateLimitKeyPrefix + publicHash(key)
-	rateLimiterSentinelKey := RateLimitKeyPrefix + publicHash(key) + ".BLOCKED"
+func (l *SessionLimiter) ForwardMessage(currentSession *SessionState, key string, store StorageHandler, enableRL, enableQ bool) sessionFailReason {
+	rateLimiterKey := RateLimitKeyPrefix + hashKey(key)
+	rateLimiterSentinelKey := RateLimitKeyPrefix + hashKey(key) + ".BLOCKED"
 
 	if enableRL {
-		if globalConf.EnableSentinelRateLImiter {
+		if config.Global.EnableSentinelRateLImiter {
 			go l.doRollingWindowWrite(key, rateLimiterKey, rateLimiterSentinelKey, currentSession, store)
 
 			// Check sentinel
@@ -86,14 +89,14 @@ func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string,
 				// Sentinel is set, fail
 				return sessionFailRateLimit
 			}
-		} else if globalConf.EnableRedisRollingLimiter {
+		} else if config.Global.EnableRedisRollingLimiter {
 			if l.doRollingWindowWrite(key, rateLimiterKey, rateLimiterSentinelKey, currentSession, store) {
 				return sessionFailRateLimit
 			}
 		} else {
 			// In-memory limiter
-			if BucketStore == nil {
-				initBucketStore()
+			if l.bucketStore == nil {
+				l.bucketStore = memorycache.New()
 			}
 
 			// If a token has been updated, we must ensure we dont use
@@ -106,7 +109,7 @@ func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string,
 				rate = uint(DRLManager.CurrentTokenValue)
 			}
 
-			userBucket, err := BucketStore.Create(bucketKey,
+			userBucket, err := l.bucketStore.Create(bucketKey,
 				rate,
 				time.Duration(currentSession.Per)*time.Second)
 			if err != nil {
@@ -114,7 +117,6 @@ func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string,
 				return sessionFailRateLimit
 			}
 
-			//log.Info("Add is: ", DRLManager.CurrentTokenValue)
 			_, errF := userBucket.Add(uint(DRLManager.CurrentTokenValue))
 
 			if errF != nil {
@@ -124,11 +126,11 @@ func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string,
 	}
 
 	if enableQ {
-		if globalConf.LegacyEnableAllowanceCountdown {
+		if config.Global.LegacyEnableAllowanceCountdown {
 			currentSession.Allowance--
 		}
 
-		if l.IsRedisQuotaExceeded(currentSession, key, store) {
+		if l.RedisQuotaExceeded(currentSession, key, store) {
 			return sessionFailQuota
 		}
 	}
@@ -137,13 +139,7 @@ func (l SessionLimiter) ForwardMessage(currentSession *SessionState, key string,
 
 }
 
-var BucketStore leakybucket.Storage
-
-func initBucketStore() {
-	BucketStore = memorycache.New()
-}
-
-func (SessionLimiter) IsRedisQuotaExceeded(currentSession *SessionState, key string, store StorageHandler) bool {
+func (l *SessionLimiter) RedisQuotaExceeded(currentSession *SessionState, key string, store StorageHandler) bool {
 
 	// Are they unlimited?
 	if currentSession.QuotaMax == -1 {
@@ -153,7 +149,7 @@ func (SessionLimiter) IsRedisQuotaExceeded(currentSession *SessionState, key str
 
 	// Create the key
 	log.Debug("[QUOTA] Inbound raw key is: ", key)
-	rawKey := QuotaKeyPrefix + publicHash(key)
+	rawKey := QuotaKeyPrefix + hashKey(key)
 	log.Debug("[QUOTA] Quota limiter key is: ", rawKey)
 	log.Debug("Renewing with TTL: ", currentSession.QuotaRenewalRate)
 	// INCR the key (If it equals 1 - set EXPIRE)

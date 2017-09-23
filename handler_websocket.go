@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/Sirupsen/logrus"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 func canonicalAddr(url *url.URL) string {
@@ -22,23 +25,24 @@ func canonicalAddr(url *url.URL) string {
 }
 
 type WSDialer struct {
-	*TykTransporter
+	*http.Transport
 	RW        http.ResponseWriter
 	TLSConfig *tls.Config
 }
 
 func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 
-	if !globalConf.HttpServerOptions.EnableWebSockets {
+	if !config.Global.HttpServerOptions.EnableWebSockets {
 		return nil, errors.New("WebSockets has been disabled on this host")
 	}
 
 	target := canonicalAddr(req.URL)
 
 	// TLS
-	dial := ws.Dial
+	dial := ws.DialContext
 	if dial == nil {
-		dial = net.Dial
+		var d net.Dialer
+		dial = d.DialContext
 	}
 
 	// We do not get this WSS scheme, need another way to identify it
@@ -50,17 +54,17 @@ func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 		} else {
 			tlsConfig = ws.TLSClientConfig
 		}
-		dial = func(network, address string) (net.Conn, error) {
+		dial = func(_ context.Context, network, address string) (net.Conn, error) {
 			return tls.Dial("tcp", target, tlsConfig)
 		}
 	}
 
-	d, err := dial("tcp", target)
+	d, err := dial(context.TODO(), "tcp", target)
 	if err != nil {
 		http.Error(ws.RW, "Error contacting backend server.", 500)
 		log.WithFields(logrus.Fields{
 			"path":   target,
-			"origin": GetIPFromRequest(req),
+			"origin": requestIP(req),
 		}).Error("Error dialing websocket backend", target, ": ", err)
 		return nil, err
 	}
@@ -76,7 +80,7 @@ func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"path":   req.URL.Path,
-			"origin": GetIPFromRequest(req),
+			"origin": requestIP(req),
 		}).Errorf("Hijack error: %v", err)
 		return nil, err
 	}
@@ -85,7 +89,7 @@ func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := req.Write(d); err != nil {
 		log.WithFields(logrus.Fields{
 			"path":   req.URL.Path,
-			"origin": GetIPFromRequest(req),
+			"origin": requestIP(req),
 		}).Errorf("Error copying request to target: %v", err)
 		return nil, err
 	}
@@ -106,7 +110,7 @@ func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 		err = cerr
 		log.WithFields(logrus.Fields{
 			"path":   req.URL.Path,
-			"origin": GetIPFromRequest(req),
+			"origin": requestIP(req),
 		}).Errorf("Error transmitting request: %v", err)
 	}
 
@@ -114,7 +118,7 @@ func (ws *WSDialer) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func IsWebsocket(req *http.Request) bool {
-	if !globalConf.HttpServerOptions.EnableWebSockets {
+	if !config.Global.HttpServerOptions.EnableWebSockets {
 		return false
 	}
 

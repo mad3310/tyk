@@ -3,7 +3,10 @@ package main
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 type HealthPrefix string
@@ -18,7 +21,7 @@ const (
 
 type HealthChecker interface {
 	Init(StorageHandler)
-	GetApiHealthValues() (HealthCheckValues, error)
+	ApiHealthValues() (HealthCheckValues, error)
 	StoreCounterVal(HealthPrefix, string)
 }
 
@@ -35,9 +38,14 @@ type DefaultHealthChecker struct {
 	APIID   string
 }
 
+var healthWarn sync.Once
+
 func (h *DefaultHealthChecker) Init(storeType StorageHandler) {
-	if globalConf.HealthCheck.EnableHealthChecks {
+	if config.Global.HealthCheck.EnableHealthChecks {
 		log.Debug("Health Checker initialised.")
+		healthWarn.Do(func() {
+			log.Warning("The Health Checker is deprecated and we do no longer recommend its use.")
+		})
 	}
 
 	h.storage = storeType
@@ -49,36 +57,35 @@ func (h *DefaultHealthChecker) CreateKeyName(subKey HealthPrefix) string {
 	return h.APIID + "." + string(subKey)
 }
 
-// ReportHealthCheckValue is a shortcut we can use throughout the app to push a health check value
-func ReportHealthCheckValue(checker HealthChecker, counter HealthPrefix, value string) {
-	// TODO: Wrap this in a conditional so it can be deactivated
-	go checker.StoreCounterVal(counter, value)
+// reportHealthValue is a shortcut we can use throughout the app to push a health check value
+func reportHealthValue(spec *APISpec, counter HealthPrefix, value string) {
+	if !config.Global.HealthCheck.EnableHealthChecks {
+		return
+	}
+	spec.Health.StoreCounterVal(counter, value)
 }
 
 func (h *DefaultHealthChecker) StoreCounterVal(counterType HealthPrefix, value string) {
-	if !globalConf.HealthCheck.EnableHealthChecks {
-		return
-	}
 	searchStr := h.CreateKeyName(counterType)
 	log.Debug("Adding Healthcheck to: ", searchStr)
 	log.Debug("Val is: ", value)
-	//go h.storage.SetKey(searchStr, value, globalConf.HealthCheck.HealthCheckValueTimeout)
+	//go h.storage.SetKey(searchStr, value, config.Global.HealthCheck.HealthCheckValueTimeout)
 	if value != "-1" {
 		// need to ensure uniqueness
 		now_string := strconv.Itoa(int(time.Now().UnixNano()))
 		value = now_string + "." + value
 		log.Debug("Set value to: ", value)
 	}
-	go h.storage.SetRollingWindow(searchStr, globalConf.HealthCheck.HealthCheckValueTimeout, value)
+	go h.storage.SetRollingWindow(searchStr, config.Global.HealthCheck.HealthCheckValueTimeout, value)
 }
 
 func (h *DefaultHealthChecker) getAvgCount(prefix HealthPrefix) float64 {
 	searchStr := h.CreateKeyName(prefix)
 	log.Debug("Searching for: ", searchStr)
 
-	count, _ := h.storage.SetRollingWindow(searchStr, globalConf.HealthCheck.HealthCheckValueTimeout, "-1")
+	count, _ := h.storage.SetRollingWindow(searchStr, config.Global.HealthCheck.HealthCheckValueTimeout, "-1")
 	log.Debug("Count is: ", count)
-	divisor := float64(globalConf.HealthCheck.HealthCheckValueTimeout)
+	divisor := float64(config.Global.HealthCheck.HealthCheckValueTimeout)
 	if divisor == 0 {
 		log.Warning("The Health Check sample timeout is set to 0, samples will never be deleted!!!")
 		divisor = 60.0
@@ -94,7 +101,7 @@ func roundValue(untruncated float64) float64 {
 	return float64(int(untruncated*100)) / 100
 }
 
-func (h *DefaultHealthChecker) GetApiHealthValues() (HealthCheckValues, error) {
+func (h *DefaultHealthChecker) ApiHealthValues() (HealthCheckValues, error) {
 	values := HealthCheckValues{}
 
 	// Get the counted / average values
@@ -106,7 +113,7 @@ func (h *DefaultHealthChecker) GetApiHealthValues() (HealthCheckValues, error) {
 	// Get the micro latency graph, an average upstream latency
 	searchStr := h.APIID + "." + string(RequestLog)
 	log.Debug("Searching KV for: ", searchStr)
-	_, vals := h.storage.SetRollingWindow(searchStr, globalConf.HealthCheck.HealthCheckValueTimeout, "-1")
+	_, vals := h.storage.SetRollingWindow(searchStr, config.Global.HealthCheck.HealthCheckValueTimeout, "-1")
 	log.Debug("Found: ", vals)
 	if len(vals) == 0 {
 		return values, nil

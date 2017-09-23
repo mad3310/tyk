@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/md5"
 	"errors"
 	"fmt"
@@ -24,13 +23,13 @@ import (
 type IdExtractor interface {
 	ExtractAndCheck(*http.Request) (string, ReturnOverrides)
 	PostProcess(*http.Request, *SessionState, string)
-	GenerateSessionID(string, *BaseMiddleware) string
+	GenerateSessionID(string, BaseMiddleware) string
 }
 
 // BaseExtractor is the base structure for an ID extractor, it implements the IdExtractor interface. Other extractors may override some of its methods.
 type BaseExtractor struct {
 	Config  *apidef.MiddlewareIdExtractor
-	BaseMid *BaseMiddleware
+	BaseMid BaseMiddleware
 	Spec    *APISpec
 }
 
@@ -39,7 +38,7 @@ func (e *BaseExtractor) ExtractAndCheck(r *http.Request) (sessionID string, retu
 	log.WithFields(logrus.Fields{
 		"prefix": "idextractor",
 	}).Error("This extractor doesn't implement an extraction method, rejecting.")
-	return "", ReturnOverrides{403, "Key not authorised"}
+	return "", ReturnOverrides{ResponseCode: 403, ResponseError: "Key not authorised"}
 }
 
 // PostProcess sets context variables and updates the storage.
@@ -84,7 +83,7 @@ func (e *BaseExtractor) ExtractBody(r *http.Request) (bodyValue string, err erro
 func (e *BaseExtractor) Error(r *http.Request, err error, message string) (returnOverrides ReturnOverrides) {
 	log.WithFields(logrus.Fields{
 		"path":   r.URL.Path,
-		"origin": GetIPFromRequest(r),
+		"origin": requestIP(r),
 	}).Info("Extractor error: ", message, ", ", err)
 
 	return ReturnOverrides{
@@ -94,7 +93,7 @@ func (e *BaseExtractor) Error(r *http.Request, err error, message string) (retur
 }
 
 // GenerateSessionID is a helper for generating session IDs, it takes an input (usually the extractor output) and a middleware pointer.
-func (e *BaseExtractor) GenerateSessionID(input string, mw *BaseMiddleware) (sessionID string) {
+func (e *BaseExtractor) GenerateSessionID(input string, mw BaseMiddleware) (sessionID string) {
 	data := []byte(input)
 	tokenID := fmt.Sprintf("%x", md5.Sum(data))
 	sessionID = mw.Spec.OrgID + tokenID
@@ -251,7 +250,6 @@ func (e *XPathExtractor) ExtractAndCheck(r *http.Request) (SessionID string, ret
 	expressionString := e.Config.ExtractorConfig["xpath_expression"].(string)
 
 	expression, err := xmlpath.Compile(expressionString)
-
 	if err != nil {
 		returnOverrides = e.Error(r, err, "XPathExtractor: bad expression")
 		return SessionID, returnOverrides
@@ -265,21 +263,18 @@ func (e *XPathExtractor) ExtractAndCheck(r *http.Request) (SessionID string, ret
 	case apidef.FormSource:
 		extractorOutput, err = e.ExtractForm(r, config.FormParamName)
 	}
-
 	if err != nil {
 		returnOverrides = e.Error(r, err, "XPathExtractor error")
 		return SessionID, returnOverrides
 	}
 
-	extractedXml, err := xmlpath.Parse(bytes.NewBufferString(extractorOutput))
-
+	extractedXml, err := xmlpath.Parse(strings.NewReader(extractorOutput))
 	if err != nil {
 		returnOverrides = e.Error(r, err, "XPathExtractor: couldn't parse input")
 		return SessionID, returnOverrides
 	}
 
 	output, ok := expression.String(extractedXml)
-
 	if !ok {
 		returnOverrides = e.Error(r, err, "XPathExtractor: no input")
 		return SessionID, returnOverrides
@@ -288,7 +283,6 @@ func (e *XPathExtractor) ExtractAndCheck(r *http.Request) (SessionID string, ret
 	SessionID = e.GenerateSessionID(output, e.BaseMid)
 
 	previousSession, keyExists := e.BaseMid.CheckSessionAndIdentityForValidKey(SessionID)
-
 	if keyExists {
 
 		lastUpdated, _ := strconv.Atoi(previousSession.LastUpdated)
@@ -307,7 +301,7 @@ func (e *XPathExtractor) ExtractAndCheck(r *http.Request) (SessionID string, ret
 }
 
 // newExtractor is called from the CP middleware for every API that specifies extractor settings.
-func newExtractor(referenceSpec *APISpec, mw *BaseMiddleware) {
+func newExtractor(referenceSpec *APISpec, mw BaseMiddleware) {
 	var extractor IdExtractor
 
 	baseExtractor := BaseExtractor{&referenceSpec.CustomMiddleware.IdExtractor, mw, referenceSpec}

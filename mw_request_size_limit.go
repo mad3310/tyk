@@ -12,14 +12,14 @@ import (
 
 // TransformMiddleware is a middleware that will apply a template to a request body to transform it's contents ready for an upstream API
 type RequestSizeLimitMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (t *RequestSizeLimitMiddleware) GetName() string {
+func (t *RequestSizeLimitMiddleware) Name() string {
 	return "RequestSizeLimitMiddleware"
 }
 
-func (t *RequestSizeLimitMiddleware) IsEnabledForSpec() bool {
+func (t *RequestSizeLimitMiddleware) EnabledForSpec() bool {
 	for _, version := range t.Spec.VersionData.Versions {
 		if len(version.ExtendedPaths.SizeLimit) > 0 {
 			return true
@@ -34,31 +34,21 @@ func (t *RequestSizeLimitMiddleware) checkRequestLimit(r *http.Request, sizeLimi
 		return errors.New("Content length is required for this request"), 411
 	}
 
-	asInt, err := strconv.Atoi(statedCL)
+	size, err := strconv.ParseInt(statedCL, 0, 64)
 	if err != nil {
 		log.Error("String conversion for content length failed:", err)
 		return errors.New("content length is not a valid Integer"), 400
 	}
-
-	// Check stated size
-	if int64(asInt) > sizeLimit {
-		log.WithFields(logrus.Fields{
-			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
-			"size":   statedCL,
-			"limit":  sizeLimit,
-		}).Info("Attempted access with large request size, blocked.")
-
-		return errors.New("Request is too large"), 400
+	if r.ContentLength > size {
+		size = r.ContentLength
 	}
 
-	// Check actual size
-	if r.ContentLength > sizeLimit {
-		// Request size is too big for globals
+	// Check stated size
+	if size > sizeLimit {
 		log.WithFields(logrus.Fields{
 			"path":   r.URL.Path,
-			"origin": GetIPFromRequest(r),
-			"size":   r.ContentLength,
+			"origin": requestIP(r),
+			"size":   size,
 			"limit":  sizeLimit,
 		}).Info("Attempted access with large request size, blocked.")
 
@@ -72,7 +62,7 @@ func (t *RequestSizeLimitMiddleware) checkRequestLimit(r *http.Request, sizeLimi
 func (t *RequestSizeLimitMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
 	log.Debug("Request size limiter active")
 
-	vInfo, versionPaths, _, _ := t.Spec.GetVersionData(r)
+	vInfo, versionPaths, _, _ := t.Spec.Version(r)
 
 	log.Debug("Global limit is: ", vInfo.GlobalSizeLimit)
 	// Manage global headers first
@@ -91,7 +81,7 @@ func (t *RequestSizeLimitMiddleware) ProcessRequest(w http.ResponseWriter, r *ht
 	}
 
 	// If there's a potential match, try to match
-	found, meta := t.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, RequestSizeLimit)
+	found, meta := t.Spec.CheckSpecMatchesStatus(r, versionPaths, RequestSizeLimit)
 	if found {
 		log.Debug("Request size limit matched for this URL, checking...")
 		rmeta := meta.(*apidef.RequestSizeMeta)

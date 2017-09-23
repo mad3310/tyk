@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 const (
@@ -25,7 +27,7 @@ type APIError struct {
 // ErrorHandler is invoked whenever there is an issue with a proxied request, most middleware will invoke
 // the ErrorHandler if something is wrong with the request and halt the request processing through the chain
 type ErrorHandler struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
 // HandleError is the actual error handler and will store the error details in analytics if analytics processing is enabled.
@@ -80,8 +82,8 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 	token := ctxGetAuthToken(r)
 	var alias string
 
-	ip := GetIPFromRequest(r)
-	if globalConf.StoreAnalytics(ip) {
+	ip := requestIP(r)
+	if config.Global.StoreAnalytics(ip) {
 
 		t := time.Now()
 
@@ -112,8 +114,8 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 
 		rawRequest := ""
 		rawResponse := ""
-		if RecordDetail(r) {
-			requestCopy := CopyHttpRequest(r)
+		if recordDetail(r) {
+			requestCopy := copyRequest(r)
 			// Get the wire format representation
 			var wireFormatReq bytes.Buffer
 			requestCopy.Write(&wireFormatReq)
@@ -159,8 +161,8 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 		record.GetGeo(ip)
 
 		expiresAfter := e.Spec.ExpireAnalyticsAfter
-		if globalConf.EnforceOrgDataAge {
-			orgExpireDataTime := e.GetOrgSessionExpiry(e.Spec.OrgID)
+		if config.Global.EnforceOrgDataAge {
+			orgExpireDataTime := e.OrgSessionExpiry(e.Spec.OrgID)
 
 			if orgExpireDataTime > 0 {
 				expiresAfter = orgExpireDataTime
@@ -169,7 +171,7 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 		}
 
 		record.SetExpiry(expiresAfter)
-		if globalConf.AnalyticsConfig.NormaliseUrls.Enabled {
+		if config.Global.AnalyticsConfig.NormaliseUrls.Enabled {
 			record.NormalisePath()
 		}
 
@@ -177,15 +179,15 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 	}
 
 	// Report in health check
-	ReportHealthCheckValue(e.Spec.Health, BlockedRequestLog, "-1")
+	reportHealthValue(e.Spec, BlockedRequestLog, "-1")
 
 	//If the config option is not set or is false, add the header
-	if !globalConf.HideGeneratorHeader {
+	if !config.Global.HideGeneratorHeader {
 		w.Header().Add("X-Generator", "tyk.io")
 	}
 
 	// Close connections
-	if globalConf.CloseConnections {
+	if config.Global.CloseConnections {
 		w.Header().Add("Connection", "close")
 	}
 

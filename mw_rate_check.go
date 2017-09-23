@@ -3,10 +3,10 @@ package main
 import "net/http"
 
 type RateCheckMW struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (m *RateCheckMW) GetName() string {
+func (m *RateCheckMW) Name() string {
 	return "RateCheckMW"
 }
 

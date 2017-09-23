@@ -5,6 +5,8 @@ import (
 
 	"github.com/spaolacci/murmur3"
 	"gopkg.in/vmihailenco/msgpack.v2"
+
+	"github.com/TykTechnologies/tyk/config"
 )
 
 type HashType string
@@ -58,13 +60,13 @@ type SessionState struct {
 	Monitor       struct {
 		TriggerLimits []float64 `json:"trigger_limits" msg:"trigger_limits"`
 	} `json:"monitor" msg:"monitor"`
-	EnableDetailedRecording bool              `json:"enable_detail_recording" msg:"enable_detail_recording"`
-	MetaData                map[string]string `json:"meta_data" msg:"meta_data"`
-	Tags                    []string          `json:"tags" msg:"tags"`
-	Alias                   string            `json:"alias" msg:"alias"`
-	LastUpdated             string            `json:"last_updated" msg:"last_updated"`
-	IdExtractorDeadline     int64             `json:"id_extractor_deadline" msg:"id_extractor_deadline"`
-	SessionLifetime         int64             `bson:"session_lifetime" json:"session_lifetime"`
+	EnableDetailedRecording bool                   `json:"enable_detail_recording" msg:"enable_detail_recording"`
+	MetaData                map[string]interface{} `json:"meta_data" msg:"meta_data"`
+	Tags                    []string               `json:"tags" msg:"tags"`
+	Alias                   string                 `json:"alias" msg:"alias"`
+	LastUpdated             string                 `json:"last_updated" msg:"last_updated"`
+	IdExtractorDeadline     int64                  `json:"id_extractor_deadline" msg:"id_extractor_deadline"`
+	SessionLifetime         int64                  `bson:"session_lifetime" json:"session_lifetime"`
 
 	firstSeenHash string
 }
@@ -81,7 +83,7 @@ func (s *SessionState) SetFirstSeenHash() {
 	s.firstSeenHash = fmt.Sprintf("%x", murmurHasher.Sum(encoded))
 }
 
-func (s *SessionState) GetHash() string {
+func (s *SessionState) Hash() string {
 	encoded, err := msgpack.Marshal(s)
 	if err != nil {
 		log.Error("Error encoding session data: ", err)
@@ -95,16 +97,16 @@ func (s *SessionState) HasChanged() bool {
 	if s.firstSeenHash == "" {
 		return true
 	}
-	if s.firstSeenHash == s.GetHash() {
+	if s.firstSeenHash == s.Hash() {
 		return false
 	}
-	// log.Debug("s.firstSeenHash: ", s.firstSeenHash, " current hash: ", s.GetHash())
+	// log.Debug("s.firstSeenHash: ", s.firstSeenHash, " current hash: ", s.Hash())
 	return true
 }
 
 func getLifetime(spec *APISpec, session *SessionState) int64 {
-	if globalConf.ForceGlobalSessionLifetime {
-		return globalConf.GlobalSessionLifetime
+	if config.Global.ForceGlobalSessionLifetime {
+		return config.Global.GlobalSessionLifetime
 	}
 	if session.SessionLifetime > 0 {
 		return session.SessionLifetime

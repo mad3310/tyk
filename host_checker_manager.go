@@ -13,6 +13,7 @@ import (
 	"gopkg.in/vmihailenco/msgpack.v2"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
 )
 
 var GlobalHostChecker HostCheckerManager
@@ -81,7 +82,7 @@ func (hc *HostCheckerManager) Start() {
 	// Start loop to check if we are active instance
 	if hc.Id != "" {
 		go hc.CheckActivePollerLoop()
-		if globalConf.UptimeTests.Config.EnableUptimeAnalytics {
+		if config.Global.UptimeTests.Config.EnableUptimeAnalytics {
 			go hc.UptimePurgeLoop()
 		}
 	}
@@ -167,9 +168,9 @@ func (hc *HostCheckerManager) StartPoller() {
 		hc.checker = &HostUptimeChecker{}
 	}
 
-	hc.checker.Init(globalConf.UptimeTests.Config.CheckerPoolSize,
-		globalConf.UptimeTests.Config.FailureTriggerSampleSize,
-		globalConf.UptimeTests.Config.TimeWait,
+	hc.checker.Init(config.Global.UptimeTests.Config.CheckerPoolSize,
+		config.Global.UptimeTests.Config.FailureTriggerSampleSize,
+		config.Global.UptimeTests.Config.TimeWait,
 		hc.currentHostList,
 		hc.OnHostDown,   // On failure
 		hc.OnHostBackUp, // On success
@@ -199,7 +200,7 @@ func (hc *HostCheckerManager) getHostKey(report HostHealthReport) string {
 }
 
 func (hc *HostCheckerManager) OnHostReport(report HostHealthReport) {
-	if globalConf.UptimeTests.Config.EnableUptimeAnalytics {
+	if config.Global.UptimeTests.Config.EnableUptimeAnalytics {
 		go hc.RecordUptimeAnalytics(report)
 	}
 }
@@ -270,7 +271,7 @@ func (hc *HostCheckerManager) OnHostBackUp(report HostHealthReport) {
 	}).Warning("[HOST CHECKER MANAGER] Host is UP:   ", report.CheckURL)
 }
 
-func (hc *HostCheckerManager) IsHostDown(urlStr string) bool {
+func (hc *HostCheckerManager) HostDown(urlStr string) bool {
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		log.WithFields(logrus.Fields{
@@ -313,16 +314,15 @@ func (hc *HostCheckerManager) PrepareTrackingHost(checkObject apidef.HostCheckOb
 
 	hostData = HostData{
 		CheckURL: checkObject.CheckURL,
-		MetaData: make(map[string]string),
-		Method:   checkObject.Method,
-		Headers:  checkObject.Headers,
-		Body:     bodyData,
+		MetaData: map[string]string{
+			UnHealthyHostMetaDataTargetKey: checkObject.CheckURL,
+			UnHealthyHostMetaDataAPIKey:    apiID,
+			UnHealthyHostMetaDataHostKey:   u.Host,
+		},
+		Method:  checkObject.Method,
+		Headers: checkObject.Headers,
+		Body:    bodyData,
 	}
-
-	// Add our specific metadata
-	hostData.MetaData[UnHealthyHostMetaDataTargetKey] = checkObject.CheckURL
-	hostData.MetaData[UnHealthyHostMetaDataAPIKey] = apiID
-	hostData.MetaData[UnHealthyHostMetaDataHostKey] = u.Host
 
 	return hostData, nil
 }
@@ -379,14 +379,14 @@ func (hc *HostCheckerManager) UpdateTrackingListByAPIID(hd []HostData, apiId str
 	}).Info("--- Queued tracking list update for API: ", apiId)
 }
 
-func (hc *HostCheckerManager) GetListFromService(apiID string) ([]HostData, error) {
+func (hc *HostCheckerManager) ListFromService(apiID string) ([]HostData, error) {
 	spec := getApiSpec(apiID)
 	if spec == nil {
 		return nil, errors.New("API ID not found in register")
 	}
 	sd := ServiceDiscovery{}
-	sd.New(&spec.UptimeTests.Config.ServiceDiscovery)
-	data, err := sd.GetTarget(spec.UptimeTests.Config.ServiceDiscovery.QueryEndpoint)
+	sd.Init(&spec.UptimeTests.Config.ServiceDiscovery)
+	data, err := sd.Target(spec.UptimeTests.Config.ServiceDiscovery.QueryEndpoint)
 
 	if err != nil {
 		log.WithFields(logrus.Fields{
@@ -423,7 +423,7 @@ func (hc *HostCheckerManager) DoServiceDiscoveryListUpdateForID(apiID string) {
 	log.WithFields(logrus.Fields{
 		"prefix": "host-check-mgr",
 	}).Debug("[HOST CHECKER MANAGER] Getting data from service")
-	hostData, err := hc.GetListFromService(apiID)
+	hostData, err := hc.ListFromService(apiID)
 	if err != nil {
 		return
 	}
@@ -512,7 +512,7 @@ func SetCheckerHostList() {
 	apisMu.RLock()
 	for _, spec := range apisByID {
 		if spec.UptimeTests.Config.ServiceDiscovery.UseDiscoveryService {
-			hostList, err := GlobalHostChecker.GetListFromService(spec.APIID)
+			hostList, err := GlobalHostChecker.ListFromService(spec.APIID)
 			if err == nil {
 				hostList = append(hostList, hostList...)
 				for _, t := range hostList {

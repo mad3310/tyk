@@ -11,10 +11,10 @@ import (
 // permission to access the specific version. If no permission data is in the SessionState, then
 // it is assumed that the user can go through.
 type AccessRightsCheck struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (a *AccessRightsCheck) GetName() string {
+func (a *AccessRightsCheck) Name() string {
 	return "AccessRightsCheck"
 }
 
@@ -31,7 +31,7 @@ func (a *AccessRightsCheck) ProcessRequest(w http.ResponseWriter, r *http.Reques
 		if !apiExists {
 			log.WithFields(logrus.Fields{
 				"path":      r.URL.Path,
-				"origin":    GetIPFromRequest(r),
+				"origin":    requestIP(r),
 				"key":       token,
 				"api_found": false,
 			}).Info("Attempted access to unauthorised API.")
@@ -57,7 +57,7 @@ func (a *AccessRightsCheck) ProcessRequest(w http.ResponseWriter, r *http.Reques
 			// Not found? Bounce
 			log.WithFields(logrus.Fields{
 				"path":          r.URL.Path,
-				"origin":        GetIPFromRequest(r),
+				"origin":        requestIP(r),
 				"key":           token,
 				"api_found":     true,
 				"version_found": false,

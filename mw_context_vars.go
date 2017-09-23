@@ -8,25 +8,21 @@ import (
 )
 
 type MiddlewareContextVars struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (m *MiddlewareContextVars) GetName() string {
+func (m *MiddlewareContextVars) Name() string {
 	return "MiddlewareContextVars"
 }
 
-func (m *MiddlewareContextVars) IsEnabledForSpec() bool {
+func (m *MiddlewareContextVars) EnabledForSpec() bool {
 	return m.Spec.EnableContextVars
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (m *MiddlewareContextVars) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
 
-	if !m.Spec.EnableContextVars {
-		return nil, 200
-	}
-
-	copiedRequest := CopyHttpRequest(r)
+	copiedRequest := copyRequest(r)
 	contextDataObject := make(map[string]interface{})
 
 	copiedRequest.ParseForm()
@@ -49,7 +45,7 @@ func (m *MiddlewareContextVars) ProcessRequest(w http.ResponseWriter, r *http.Re
 	contextDataObject["path"] = copiedRequest.URL.Path
 
 	// IP:Port
-	contextDataObject["remote_addr"] = copiedRequest.RemoteAddr
+	contextDataObject["remote_addr"] = requestIP(copiedRequest)
 
 	//Correlation ID
 	contextDataObject["request_id"] = uuid.NewV4().String()

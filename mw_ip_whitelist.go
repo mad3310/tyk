@@ -8,25 +8,20 @@ import (
 
 // IPWhiteListMiddleware lets you define a list of IPs to allow upstream
 type IPWhiteListMiddleware struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (i *IPWhiteListMiddleware) GetName() string {
+func (i *IPWhiteListMiddleware) Name() string {
 	return "IPWhiteListMiddleware"
 }
 
-func (i *IPWhiteListMiddleware) IsEnabledForSpec() bool {
+func (i *IPWhiteListMiddleware) EnabledForSpec() bool {
 	return i.Spec.EnableIpWhiteListing && len(i.Spec.AllowedIPs) > 0
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (i *IPWhiteListMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	// Disabled, pass through
-	if !i.Spec.EnableIpWhiteListing {
-		return nil, 200
-	}
-
-	remoteIP := net.ParseIP(GetIPFromRequest(r))
+	remoteIP := net.ParseIP(requestIP(r))
 
 	// Enabled, check incoming IP address
 	for _, ip := range i.Spec.AllowedIPs {
@@ -50,9 +45,9 @@ func (i *IPWhiteListMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// Fire Authfailed Event
-	AuthFailed(i.BaseMiddleware, r, remoteIP.String())
+	AuthFailed(i, r, remoteIP.String())
 	// Report in health check
-	ReportHealthCheckValue(i.Spec.Health, KeyFailure, "-1")
+	reportHealthValue(i.Spec, KeyFailure, "-1")
 
 	// Not matched, fail
 	return errors.New("Access from this IP has been disallowed"), 403

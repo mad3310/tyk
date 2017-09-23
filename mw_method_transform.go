@@ -10,14 +10,14 @@ import (
 
 // TransformMiddleware is a middleware that will apply a template to a request body to transform it's contents ready for an upstream API
 type TransformMethod struct {
-	*BaseMiddleware
+	BaseMiddleware
 }
 
-func (t *TransformMethod) GetName() string {
+func (t *TransformMethod) Name() string {
 	return "TransformMethod"
 }
 
-func (t *TransformMethod) IsEnabledForSpec() bool {
+func (t *TransformMethod) EnabledForSpec() bool {
 	for _, version := range t.Spec.VersionData.Versions {
 		if len(version.ExtendedPaths.MethodTransforms) > 0 {
 			return true
@@ -28,8 +28,8 @@ func (t *TransformMethod) IsEnabledForSpec() bool {
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (t *TransformMethod) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	_, versionPaths, _, _ := t.Spec.GetVersionData(r)
-	found, meta := t.Spec.CheckSpecMatchesStatus(r.URL.Path, r.Method, versionPaths, MethodTransformed)
+	_, versionPaths, _, _ := t.Spec.Version(r)
+	found, meta := t.Spec.CheckSpecMatchesStatus(r, versionPaths, MethodTransformed)
 	if !found {
 		return nil, 200
 	}
