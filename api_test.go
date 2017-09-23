@@ -453,12 +453,13 @@ func TestInvalidateCache(t *testing.T) {
 		// not exist. This test should be improved to check that the
 		// endpoint actually did what it's supposed to.
 		rec := httptest.NewRecorder()
-		req := withAuth(testReq(t, "DELETE", "/tyk/cache/1"+suffix, nil))
+		uri := "/tyk/cache/1"+suffix
+		req := withAuth(testReq(t, "DELETE", uri, nil))
 
 		mainRouter.ServeHTTP(rec, req)
 
 		if rec.Code != 200 {
-			t.Errorf("Could not invalidate cache: %v\n%v", rec.Code, rec.Body)
+			t.Errorf("Could not invalidate cache: %v\n%v\n%v", rec.Code, rec.Body, uri)
 		}
 	}
 }

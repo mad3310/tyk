@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"fmt"
 
 	"github.com/Sirupsen/logrus"
 	prefixed "github.com/x-cray/logrus-prefixed-formatter"
@@ -92,6 +93,7 @@ leakMid.NewProcessRequest(function(request, session) {
 	dynMid.ProcessRequest(nil, req, nil)
 
 	bs, err := ioutil.ReadAll(req.Body)
+	fmt.Printf("%s", string(bs))
 	if err != nil {
 		t.Fatalf("failed to read final body: %v", err)
 	}

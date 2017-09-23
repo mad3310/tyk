@@ -182,10 +182,10 @@ func TestNewCustomTemplate(t *testing.T) {
 	}{
 		{"UseDefault", false, "", false},
 		{"FallbackToDefault", false, "missing_webhook.json", false},
-		{"UseCustom", false, "templates/breaker_webhook.json", false},
+		{"UseCustom", false, "/etc/tyk/templates/breaker_webhook.json", false},
 		{"MissingDefault", true, "", true},
 		{"MissingDefaultFallback", true, "missing_webhook.json", true},
-		{"MissingDefaultNotNeeded", true, "templates/breaker_webhook.json", false},
+		{"MissingDefaultNotNeeded", true, "/etc/tyk/templates/breaker_webhook.json", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
