@@ -143,10 +143,13 @@ func TestMain(m *testing.M) {
 	}
 	globalConf.EnableAnalytics = true
 	globalConf.AnalyticsConfig.EnableGeoIP = true
-	globalConf.AnalyticsConfig.GeoIPDBLocation = filepath.Join("testdata", "MaxMind-DB-test-ipv4-24.mmdb")
+	globalConf.AnalyticsConfig.GeoIPDBLocation = filepath.Join("/root/goprojects/src/github.com/TykTechnologies/tyk/testdata", "MaxMind-DB-test-ipv4-24.mmdb")
 	globalConf.EnableJSVM = true
 	globalConf.Monitor.EnableTriggerMonitors = true
 	globalConf.AnalyticsConfig.NormaliseUrls.Enabled = true
+	globalConf.TemplatePath = "/etc/tyk/templates"
+	globalConf.MiddlewarePath = "/etc/tyk/middleware"
+	globalConf.TykJSPath = "/etc/tyk/js/tyk.js"
 	afterConfSetup(&globalConf)
 	initialiseSystem(nil)
 	if analytics.GeoIPDB == nil {

@@ -28,7 +28,7 @@ const virtTestDef = `{
 					"virtual": [{
 						"response_function_name": "testVirtData",
 						"function_source_type": "file",
-						"function_source_uri": "middleware/testVirtData.js",
+						"function_source_uri": "/etc/tyk/middleware/testVirtData.js",
 						"path": "/test-data",
 						"method": "GET"
 					}]
@@ -60,7 +60,7 @@ function testVirtData(request, session, config) {
 `
 
 func TestVirtualEndpoint(t *testing.T) {
-	mwPath := filepath.Join("middleware", "testVirtData.js")
+	mwPath := filepath.Join("/etc/tyk/middleware/", "testVirtData.js")
 	if err := ioutil.WriteFile(mwPath, []byte(virtTestJS), 0644); err != nil {
 		t.Fatal(err)
 	}
