@@ -354,6 +354,25 @@ func (a APIDefinitionLoader) ParseDefinition(apiDef []byte) *apidef.APIDefinitio
 	return def
 }
 
+func (a APIDefinitionLoader) FromRedis() []*APISpec {
+	var apiSpecs []*APISpec
+	
+	storageManager := getGlobalStorageHandler("api-definition-", true)
+	storageManager.Connect()
+	
+	kvmap := storageManager.GetKeysAndValuesWithFilter("")
+	if kvmap == nil {
+		return nil
+	}
+	
+	for _, apiDefinition := range kvmap {
+		def := a.ParseDefinition([]byte(apiDefinition))
+		spec := a.MakeSpec(def)
+		apiSpecs = append(apiSpecs, spec)
+	}
+	return apiSpecs
+}
+
 // FromDir will load APIDefinitions from a directory on the filesystem. Definitions need
 // to be the JSON representation of APIDefinition object
 func (a APIDefinitionLoader) FromDir(dir string) []*APISpec {

@@ -203,7 +203,8 @@ func getAPISpecs() []*APISpec {
 
 		apiSpecs = loader.FromRPC(config.Global.SlaveOptions.RPCKey)
 	} else {
-		apiSpecs = loader.FromDir(config.Global.AppPath)
+		apiSpecs = loader.FromRedis()
+//		apiSpecs = loader.FromDir(config.Global.AppPath)
 	}
 
 	log.WithFields(logrus.Fields{

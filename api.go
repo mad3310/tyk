@@ -446,11 +446,6 @@ func handleGetAPI(apiID string) (interface{}, int) {
 }
 
 func handleAddOrUpdateApi(apiID string, r *http.Request) (interface{}, int) {
-	if config.Global.UseDBAppConfigs {
-		log.Error("Rejected new API Definition due to UseDBAppConfigs = true")
-		return apiError("Due to enabled use_db_app_configs, please use the Dashboard API"), 500
-	}
-
 	newDef := &apidef.APIDefinition{}
 	if err := json.NewDecoder(r.Body).Decode(newDef); err != nil {
 		log.Error("Couldn't decode new API Definition object: ", err)
@@ -482,6 +477,14 @@ func handleAddOrUpdateApi(apiID string, r *http.Request) (interface{}, int) {
 		log.Error("Failed to create file! - ", err)
 		return apiError("File object creation failed, write error"), 500
 	}
+	
+	storageManager := getGlobalStorageHandler("api-definition-", true)
+	storageManager.Connect()
+	
+	if err := storageManager.SetKey(newDef.APIID, "api-def", -1); err != nil {
+		log.Error("Failed to store API Definition to redis! - ", err)
+		return apiError("Store API Definition failed, store error"), 500
+	}
 
 	action := "modified"
 	if r.Method == "POST" {
@@ -507,6 +510,14 @@ func handleDeleteAPI(apiID string) (interface{}, int) {
 	}
 
 	os.Remove(defFilePath)
+	
+	storageManager := getGlobalStorageHandler("api-definition-", true)
+	storageManager.Connect()
+	
+	if result := storageManager.DeleteKey(apiID); !result {
+		log.Error("Failed to delete API Definition from redis! - ")
+		return apiError("delete API Definition failed, delete error"), 500
+	}
 
 	response := APIModifyKeySuccess{
 		apiID,
