@@ -892,7 +892,8 @@ const sampleAPI = `{
 	"proxy": {
 		"listen_path": "/sample",
 		"target_url": "` + testHttpAny + `"
-	}
+	},
+	"active": true
 }`
 
 func TestListener(t *testing.T) {
@@ -938,6 +939,22 @@ func TestControlListener(t *testing.T) {
 	testHttp(t, tests, true)
 }
 
+func TestHttpPprof(t *testing.T) {
+	old := httpProfile
+	defer func() { httpProfile = old }()
+
+	testHttp(t, []tykHttpTest{
+		{method: "GET", path: "/debug/pprof/", code: 404},
+		{method: "GET", path: "/debug/pprof/", code: 404, controlRequest: true},
+	}, true)
+	httpProfile = true
+	doReload()
+	testHttp(t, []tykHttpTest{
+		{method: "GET", path: "/debug/pprof/", code: 404},
+		{method: "GET", path: "/debug/pprof/", code: 200, controlRequest: true},
+	}, true)
+}
+
 func TestManagementNodeRedisEvents(t *testing.T) {
 	defer func() {
 		config.Global.ManagementNode = false
@@ -969,7 +986,8 @@ const apiWithTykListenPathPrefix = `{
 	"proxy": {
 		"listen_path": "/tyk-foo/",
 		"target_url": "` + testHttpAny + `"
-	}
+	},
+	"active": true
 }`
 
 func TestListenPathTykPrefix(t *testing.T) {
