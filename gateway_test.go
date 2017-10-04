@@ -883,6 +883,10 @@ func testHttp(t *testing.T, tests []tykHttpTest, separateControlPort bool) {
 const sampleAPI = `{
 	"api_id": "test",
 	"use_keyless": true,
+	"definition": {
+		"location": "header",
+		"key": "version"
+	},
 	"version_data": {
 		"not_versioned": true,
 		"versions": {
@@ -892,8 +896,7 @@ const sampleAPI = `{
 	"proxy": {
 		"listen_path": "/sample",
 		"target_url": "` + testHttpAny + `"
-	},
-	"active": true
+	}
 }`
 
 func TestListener(t *testing.T) {
@@ -986,8 +989,7 @@ const apiWithTykListenPathPrefix = `{
 	"proxy": {
 		"listen_path": "/tyk-foo/",
 		"target_url": "` + testHttpAny + `"
-	},
-	"active": true
+	}
 }`
 
 func TestListenPathTykPrefix(t *testing.T) {
@@ -1100,5 +1102,54 @@ func TestSkipUrlCleaning(t *testing.T) {
 
 	if string(body) != "/http://example.com" {
 		t.Error("Should not strip URL", string(body))
+	}
+}
+
+func TestMultiTargetProxy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseURL := "http://" + ln.Addr().String()
+	listen(ln, nil, nil)
+
+	defer ln.Close()
+
+	buildAndLoadAPI(func(spec *APISpec) {
+		spec.VersionData.NotVersioned = false
+		spec.VersionData.Versions = map[string]apidef.VersionInfo{
+			"vdef": {Name: "vdef"},
+			"vother": {
+				Name:           "vother",
+				OverrideTarget: testHttpAny + "/vother",
+			},
+		}
+		spec.Proxy.ListenPath = "/"
+	})
+	tests := []struct {
+		version, wantPath string
+	}{
+		{"vdef", "/"},
+		{"vother", "/vother"},
+	}
+
+	for _, tc := range tests {
+		req, err := http.NewRequest("GET", baseURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("version", tc.version)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var testResp testHttpResponse
+		if err := json.NewDecoder(resp.Body).Decode(&testResp); err != nil {
+			t.Fatal(err)
+		}
+		if testResp.Url != tc.wantPath {
+			t.Fatalf("wanted path %s, got %s", tc.wantPath, testResp.Url)
+		}
 	}
 }
